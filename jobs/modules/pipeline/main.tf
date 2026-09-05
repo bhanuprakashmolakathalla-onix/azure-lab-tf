@@ -80,20 +80,20 @@ resource "databricks_job" "medallion" {
     }
   }
 
-  task {
-    task_key        = "silver"
-    job_cluster_key = "pipeline"
-
-    depends_on {
-      task_key = "bronze"
-    }
-
-    notebook_task {
-      notebook_path   = databricks_notebook.layer["silver"].path
-      base_parameters = { catalog = var.env }
-    }
-  }
-
+  # ORDER MATTERS HERE, AND NOT FOR THE REASON IT LOOKS LIKE.
+  #
+  # These blocks are listed bronze -> gold -> silver, which reads wrong. Execution
+  # order is NOT set by block order - it comes from the depends_on blocks below,
+  # and is still bronze -> silver -> gold.
+  #
+  # The listing order is alphabetical because that is how the Databricks API
+  # returns tasks when Terraform reads the job back. `task` is a LIST, matched
+  # positionally, so a config ordered bronze/silver/gold against an API response
+  # ordered bronze/gold/silver produces a diff on every single plan - one that
+  # "applies" successfully and reappears immediately.
+  #
+  # A perpetual diff is worse than it sounds in CI: no run is ever clean, so
+  # "no changes" stops carrying information and people stop reading plans.
   task {
     task_key        = "gold"
     job_cluster_key = "pipeline"
@@ -104,6 +104,20 @@ resource "databricks_job" "medallion" {
 
     notebook_task {
       notebook_path   = databricks_notebook.layer["gold"].path
+      base_parameters = { catalog = var.env }
+    }
+  }
+
+  task {
+    task_key        = "silver"
+    job_cluster_key = "pipeline"
+
+    depends_on {
+      task_key = "bronze"
+    }
+
+    notebook_task {
+      notebook_path   = databricks_notebook.layer["silver"].path
       base_parameters = { catalog = var.env }
     }
   }
