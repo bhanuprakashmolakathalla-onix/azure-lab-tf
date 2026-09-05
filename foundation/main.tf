@@ -1,10 +1,6 @@
 # The foundation: resource group, ADLS Gen2 lake, and the managed identity that
 # Unity Catalog will later use to reach it. Everything Day 1 built by hand.
 
-# Who am I? Used below to grant yourself data-plane access to the lake, the same
-# way bootstrap-backend.ps1 did for the state account.
-data "azurerm_client_config" "current" {}
-
 # --- Resource group -------------------------------------------------------
 #
 # Reminder on the false friend: this is NOT a GCP project. It is a lifecycle and
@@ -132,10 +128,32 @@ resource "azurerm_role_assignment" "uc_on_lake" {
   skip_service_principal_aad_check = true
 }
 
-# You, too. Owner lets you create this account but not list a single blob, so
-# without this you cannot browse the lake in the portal or with `az storage`.
-resource "azurerm_role_assignment" "me_on_lake" {
+# Human and machine data-plane access to the lake.
+#
+# These object ids are PINNED, and that is the whole point.
+#
+# This originally used data.azurerm_client_config.current.object_id - "whoever is
+# running Terraform". That is fine until two different identities run the same
+# config. Locally it resolved to Bhanu; in CI it resolved to the service
+# principal; principal_id is ForceNew, so every alternating run DESTROYED the
+# assignment and recreated it for the other identity. Your access to the lake
+# would silently vanish whenever CI ran last.
+#
+# The rule: never let a persistent grant depend on who happens to be applying.
+# A data source that answers "who am I" belongs in outputs and preconditions,
+# never in the identity of a resource that must outlive the run.
+resource "azurerm_role_assignment" "lake_data_admins" {
+  for_each = var.lake_data_admins
+
   scope                = azurerm_storage_account.lake.id
   role_definition_name = "Storage Blob Data Contributor"
-  principal_id         = data.azurerm_client_config.current.object_id
+  principal_id         = each.value.object_id
+
+  # Only meaningful for service principals, and actively WRONG for users: the
+  # provider translates this flag into principalType=ServicePrincipal on the
+  # request, and Azure rejects it when the object is a User.
+  #
+  # Its real job is tolerating Entra replication lag for a freshly created
+  # service principal, which is a problem users never have.
+  skip_service_principal_aad_check = each.value.type == "ServicePrincipal"
 }

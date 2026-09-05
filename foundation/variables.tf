@@ -57,3 +57,27 @@ variable "tags" {
     autodelete = "true"
   }
 }
+
+variable "lake_data_admins" {
+  description = "Principals granted Storage Blob Data Contributor on the lake. Explicit and pinned - never derived from whoever runs Terraform."
+
+  # The type matters, not just the id. Azure validates that a role assignment's
+  # declared principal type matches the directory object, and the provider infers
+  # that type from skip_service_principal_aad_check - so a User and a service
+  # principal cannot share one code path.
+  type = map(object({
+    object_id = string
+    type      = string # "User" or "ServicePrincipal"
+  }))
+
+  default = {
+    bhanu = {
+      object_id = "8dc9b67e-9fcd-4585-b76f-e00b943ac693" # Entra USER object id
+      type      = "User"
+    }
+    ci = {
+      object_id = "cecdbc56-5731-411d-aa79-6a94f2d6ddd3" # SP object id, NOT the app id
+      type      = "ServicePrincipal"
+    }
+  }
+}

@@ -21,9 +21,21 @@ env:
   ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
   ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
   ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
-  # Tells both azurerm AND the databricks provider to exchange the GitHub OIDC
-  # token rather than look for a client secret.
+  # azurerm exchanges the GitHub OIDC token directly.
   ARM_USE_OIDC: "true"
+
+  # The databricks provider does NOT. Left alone it performs its OWN token
+  # exchange against Entra, requesting a GitHub token with its own audience -
+  # and that pairing is not what our federated credential trusts, so Entra
+  # returns AADSTS700213 naming a subject that is demonstrably correct. The
+  # subject matches; the audience does not.
+  #
+  # azure/login has already authenticated the Azure CLI on this runner using the
+  # federated credential that DOES work. Pointing the provider at that session
+  # removes the second exchange entirely - one identity, one trust relationship,
+  # nothing extra to keep in sync.
+  DATABRICKS_AUTH_TYPE: azure-cli
+
   TF_IN_AUTOMATION: "true"
 
 jobs:

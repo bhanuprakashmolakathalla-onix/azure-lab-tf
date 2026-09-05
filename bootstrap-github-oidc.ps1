@@ -22,6 +22,10 @@
 param(
     [Parameter(Mandatory = $true)][string]$GitHubOwner,
     [Parameter(Mandatory = $true)][string]$GitHubRepo,
+    # Immutable numeric ids. Find them in a failed run's log ("subject claim"),
+    # or from the API: https://api.github.com/repos/OWNER/REPO -> .owner.id / .id
+    [Parameter(Mandatory = $true)][string]$OwnerId,
+    [Parameter(Mandatory = $true)][string]$RepoId,
     [string]$AppId  = "399c031a-6a58-4b51-9423-db05f87fa3bc",
     [string]$Branch = "main"
 )
@@ -36,9 +40,22 @@ Write-Host "=== GitHub OIDC federation ===" -ForegroundColor Cyan
 #
 # Keeping them separate is what lets the workflow refuse to apply from a PR,
 # enforced by Entra rather than only by workflow logic someone could edit.
+# IMMUTABLE SUBJECT FORMAT: repo:OWNER@OWNER_ID/REPO@REPO_ID:...
+#
+# GitHub made this the default for repositories created after 2026-07-15, and it
+# is a real security fix rather than churn. The old name-only format was exposed
+# to SUBJECT RECYCLING: delete a repo or rename an org, someone else claims the
+# name, and their workflows mint tokens matching a subject your cloud still
+# trusts. Numeric ids are never reissued, so the claim is permanently bound to
+# THIS repository.
+#
+# The cost is that the subject is no longer guessable - you read it out of the
+# token, not out of the repo URL.
+$slug = "$GitHubOwner@$OwnerId/$GitHubRepo@$RepoId"
+
 $subjects = @(
-    @{ name = "github-$GitHubRepo-$Branch"; subject = "repo:$GitHubOwner/${GitHubRepo}:ref:refs/heads/$Branch"; desc = "Apply from $Branch" },
-    @{ name = "github-$GitHubRepo-pr";      subject = "repo:$GitHubOwner/${GitHubRepo}:pull_request";           desc = "Plan from pull requests" }
+    @{ name = "github-$GitHubRepo-$Branch"; subject = "repo:${slug}:ref:refs/heads/$Branch"; desc = "Apply from $Branch" },
+    @{ name = "github-$GitHubRepo-pr";      subject = "repo:${slug}:pull_request";           desc = "Plan from pull requests" }
 )
 
 $existing = az ad app federated-credential list --id $AppId --query "[].name" --output tsv
