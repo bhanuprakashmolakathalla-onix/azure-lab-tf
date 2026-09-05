@@ -1,0 +1,20 @@
+# Normalise line endings.
+#
+# You are authoring on Windows and CI runs on ubuntu-latest. Without this, files
+# committed with CRLF reach the Linux runner with trailing \r, and the failures
+# are baffling: `terraform fmt -check` reports diffs it will not show you, and a
+# Python file's last token on each line silently carries a \r.
+#
+# * text=auto keeps working copies native (CRLF locally) while storing LF in the
+# repo, which is what the runner then checks out.
+* text=auto
+
+# Belt and braces for the files CI actually executes or parses.
+*.tf      text eol=lf
+*.hcl     text eol=lf
+*.py      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# PowerShell stays CRLF - it is only ever run on Windows, and PS 5.1 is happier.
+*.ps1     text eol=crlf
