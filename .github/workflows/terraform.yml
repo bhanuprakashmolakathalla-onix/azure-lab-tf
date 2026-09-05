@@ -1,0 +1,119 @@
+name: terraform
+
+# PRs plan. Merges to main apply. That split is the entire safety model:
+# nothing reaches Azure without review, and review sees the actual plan.
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  # THE line that makes secretless auth work. Without id-token: write, GitHub
+  # will not mint an OIDC token and azure/login has nothing to exchange.
+  id-token: write
+  contents: read
+  # So the plan can be posted back onto the PR.
+  pull-requests: write
+
+env:
+  ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
+  ARM_TENANT_ID: ${{ vars.ARM_TENANT_ID }}
+  ARM_SUBSCRIPTION_ID: ${{ vars.ARM_SUBSCRIPTION_ID }}
+  # Tells both azurerm AND the databricks provider to exchange the GitHub OIDC
+  # token rather than look for a client secret.
+  ARM_USE_OIDC: "true"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  terraform:
+    runs-on: ubuntu-latest
+
+    # Modules run in DEPENDENCY ORDER, not in parallel. Each reads the previous
+    # one's outputs through terraform_remote_state, so workspace cannot plan
+    # until foundation has applied.
+    #
+    # max-parallel: 1 is doing real work here - a matrix would otherwise run
+    # them concurrently and the later ones would fail reading state that does
+    # not exist yet.
+    strategy:
+      max-parallel: 1
+      fail-fast: true
+      matrix:
+        module: [foundation, workspace, jobs]
+
+    defaults:
+      run:
+        working-directory: ${{ matrix.module }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Logs the Azure CLI in via OIDC. The azurerm provider could manage
+      # without this, but the databricks provider falls back to the CLI session
+      # for workspace auth, so it is load-bearing here.
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.ARM_CLIENT_ID }}
+          tenant-id: ${{ vars.ARM_TENANT_ID }}
+          subscription-id: ${{ vars.ARM_SUBSCRIPTION_ID }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.8"
+          # Wrapper off so `terraform plan -detailed-exitcode` exit codes reach
+          # us intact rather than being swallowed.
+          terraform_wrapper: false
+
+      # fmt -check fails the build on unformatted code. Cheap, and it ends every
+      # argument about formatting permanently.
+      - name: Format check
+        run: terraform fmt -check -recursive
+
+      - name: Init
+        run: terraform init -input=false
+
+      - name: Validate
+        run: terraform validate
+
+      # -detailed-exitcode: 0 = no changes, 2 = changes present, 1 = error.
+      # Distinguishing "no drift" from "drift" from "broken" is what lets a
+      # scheduled run become drift detection later.
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -out=tfplan -detailed-exitcode
+          code=$?
+          set -e
+          echo "exitcode=$code" >> "$GITHUB_OUTPUT"
+          if [ "$code" = "1" ]; then exit 1; fi
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Comment plan on PR
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ matrix.module }}/plan.txt', 'utf8');
+            const changed = '${{ steps.plan.outputs.exitcode }}' === '2';
+            // GitHub comments cap at 65536 chars; a big plan must be truncated.
+            const body = changed
+              ? `### \`${{ matrix.module }}\` — changes planned\n\n<details><summary>Show plan</summary>\n\n\`\`\`terraform\n${plan.slice(0, 60000)}\n\`\`\`\n\n</details>`
+              : `### \`${{ matrix.module }}\` — no changes`;
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body,
+            });
+
+      # Apply ONLY from main, and only the plan file that was just reviewed.
+      # Applying `tfplan` rather than re-planning means what runs is exactly what
+      # was shown - no window for the world to change underneath you.
+      - name: Apply
+        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        run: terraform apply -input=false -auto-approve tfplan
