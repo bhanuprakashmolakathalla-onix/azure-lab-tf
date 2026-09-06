@@ -41,7 +41,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        module: [foundation, workspace, unity-catalog, jobs, governance]
+        module: [infra/network, infra/foundation, infra/workspace, data/catalog, data/pipelines, infra/governance]
 
     defaults:
       run:

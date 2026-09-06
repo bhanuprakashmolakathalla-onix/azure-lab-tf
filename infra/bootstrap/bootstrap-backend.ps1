@@ -180,7 +180,11 @@ terraform {
 }
 "@
 
-$outPath = Join-Path $PSScriptRoot "foundation\backend.tf"
+# The bootstrap scripts now live in infra/bootstrap/, so the repo root is two
+# levels up. Written as a derivation rather than a literal path so moving the
+# script again breaks loudly instead of silently writing to the wrong place.
+$repoRoot = Split-Path (Split-Path $PSScriptRoot -Parent) -Parent
+$outPath  = Join-Path $repoRoot "infra\foundation\backend.tf"
 New-Item -ItemType Directory -Force -Path (Split-Path $outPath) | Out-Null
 # WriteAllText, not Out-File: PowerShell 5.1 writes a UTF-8 BOM that some
 # tooling chokes on. .NET's WriteAllText defaults to UTF-8 without BOM.
