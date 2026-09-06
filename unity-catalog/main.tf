@@ -206,6 +206,38 @@ resource "databricks_group_member" "platform_admin_ci" {
   member_id = databricks_service_principal.ci.id
 }
 
+# NOT OPTIONAL, and omitting it is how this group locked everyone out.
+#
+# An account-level group is invisible inside a workspace until it is ASSIGNED
+# there. Membership still exists at the account, but a workspace-scoped token
+# does not carry the group, so:
+#
+#   - ownership-by-group does not apply to you in that workspace
+#   - and if that group owns the objects, you cannot read your own metastore
+#
+# Which is exactly what happened: the owner transfer succeeded, and every
+# principal instantly lost access to the objects because nobody's workspace
+# identity included platform-admins.
+#
+# Same rule as Day 4 (identity -> assignment -> grants); this is the assignment
+# step again, one level up, applied to ownership instead of privileges.
+#
+# ADMIN rather than USER: this group owns the platform's UC objects and is the
+# identity CI operates as, so it needs to administer both workspaces.
+resource "databricks_mws_permission_assignment" "platform_admins_dev" {
+  provider     = databricks.account
+  workspace_id = local.workspaces.workspace_ids["dev"]
+  principal_id = databricks_group.platform_admins.id
+  permissions  = ["ADMIN"]
+}
+
+resource "databricks_mws_permission_assignment" "platform_admins_prod" {
+  provider     = databricks.account
+  workspace_id = local.workspaces.workspace_ids["prod"]
+  principal_id = databricks_group.platform_admins.id
+  permissions  = ["ADMIN"]
+}
+
 # Find yourself at account level so you can be put in a group.
 data "databricks_user" "me" {
   provider  = databricks.account
