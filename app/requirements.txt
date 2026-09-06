@@ -1,0 +1,6 @@
+# Minimum versions rather than exact pins: the Dockerfile builds a fresh image
+# each time, and a lock file belongs in the image build, not scattered here.
+fastapi>=0.115
+uvicorn[standard]>=0.32
+databricks-sql-connector>=3.4
+azure-identity>=1.19
