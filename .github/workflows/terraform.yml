@@ -111,6 +111,66 @@ jobs:
           if [ "$code" = "1" ]; then exit 1; fi
           terraform show -no-color tfplan > plan.txt
 
+      # Renders into the right-hand pane of the PR's "Checks" tab, and onto the
+      # job summary page. GITHUB_STEP_SUMMARY takes GitHub-flavoured markdown.
+      #
+      # Colour comes from a ```diff fence: GitHub's syntax highlighter paints
+      # lines starting with + green, - red, and ! orange. That is the only
+      # reliable way to get colour into a summary - inline HTML styling is
+      # stripped, and there is no colour syntax in GFM.
+      #
+      # `terraform show -json` is what makes this possible at all. Never scrape
+      # the human-readable plan text; it is explicitly not a stable interface,
+      # whereas the JSON has a versioned schema.
+      - name: Plan summary
+        if: always()
+        run: |
+          M="${{ matrix.module }}"
+          if [ ! -f tfplan ]; then
+            echo "### \`$M\` — plan did not complete" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          terraform show -json tfplan > plan.json
+
+          # actions is an ARRAY: ["create"], ["update"], ["delete"], ["no-op"],
+          # and ["delete","create"] for a replacement. Length > 1 means replace.
+          q() { jq -r "$1" plan.json; }
+          add=$(q '[.resource_changes[]? | select(.change.actions == ["create"])] | length')
+          chg=$(q '[.resource_changes[]? | select(.change.actions == ["update"])] | length')
+          del=$(q '[.resource_changes[]? | select(.change.actions == ["delete"])] | length')
+          rep=$(q '[.resource_changes[]? | select((.change.actions | length) > 1)] | length')
+          total=$((add + chg + del + rep))
+
+          {
+            echo "## \`$M\`"
+            echo ""
+            if [ "$total" -eq 0 ]; then
+              echo "### ✅ No changes"
+              echo ""
+              echo "Real infrastructure matches the configuration."
+            else
+              echo "| 🟢 Add | 🟡 Change | ♻️ Replace | 🔴 Destroy |"
+              echo "|:---:|:---:|:---:|:---:|"
+              echo "| **$add** | **$chg** | **$rep** | **$del** |"
+              echo ""
+              echo "<details open><summary><b>Resources</b></summary>"
+              echo ""
+              echo '```diff'
+              q '.resource_changes[]? | select(.change.actions != ["no-op"]) |
+                 if   (.change.actions | length) > 1 then "! REPLACE  " + .address
+                 elif .change.actions == ["create"]  then "+ CREATE   " + .address
+                 elif .change.actions == ["update"]  then "~ UPDATE   " + .address
+                 elif .change.actions == ["delete"]  then "- DESTROY  " + .address
+                 else "  " + .address end'
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+            echo ""
+            echo "<sub>Terraform $(terraform version -json | jq -r .terraform_version) · commit \`${GITHUB_SHA:0:7}\`</sub>"
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Comment plan on PR
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7

@@ -18,6 +18,11 @@ variable "schemas" {
   type        = list(string)
 }
 
+variable "owner" {
+  description = "Group that owns the catalog and its schemas. A GROUP, never a person - see the platform_admins comment in the root module."
+  type        = string
+}
+
 variable "read_only_workspace_ids" {
   description = "Extra workspaces that may READ this catalog but never write to it. Map of label -> numeric workspace id."
   type        = map(string)

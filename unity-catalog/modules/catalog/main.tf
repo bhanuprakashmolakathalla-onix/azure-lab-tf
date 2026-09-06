@@ -2,6 +2,7 @@ resource "databricks_catalog" "this" {
   name         = var.name
   storage_root = var.storage_root
   comment      = "${var.name} environment. Managed by Terraform."
+  owner        = var.owner
 
   # The line that does the work.
   #
@@ -40,6 +41,7 @@ resource "databricks_schema" "layer" {
   catalog_name = databricks_catalog.this.name
   name         = each.value
   comment      = "${each.value} layer"
+  owner        = var.owner
 
   force_destroy = true
 

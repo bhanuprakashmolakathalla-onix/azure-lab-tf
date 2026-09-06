@@ -41,11 +41,26 @@ resource "databricks_storage_credential" "adls" {
   name    = "sc-lab01-adls"
   comment = "Managed identity for the lab lake. Managed by Terraform."
 
+  # Group, never a person. See the platform_admins comment above.
+  owner = databricks_group.platform_admins.display_name
+
   azure_managed_identity {
     access_connector_id = local.foundation.access_connector_id
   }
 
   force_destroy = true
+
+  # NOT redundant. Terraform's implicit dependencies follow REFERENCES, and
+  # `owner` above references the group's display_name - not its membership. So
+  # without this, Terraform may legally hand ownership to platform-admins BEFORE
+  # anyone is in it, and the apply loses its own permissions half way through.
+  #
+  # Everything else chains off this: external locations reference the credential,
+  # and the catalog modules depend on the external locations.
+  depends_on = [
+    databricks_group_member.platform_admin_me,
+    databricks_group_member.platform_admin_ci,
+  ]
 }
 
 resource "databricks_external_location" "layers" {
@@ -56,6 +71,7 @@ resource "databricks_external_location" "layers" {
   url             = each.value
   credential_name = databricks_storage_credential.adls.name
   comment         = "Lab lake: ${each.key}"
+  owner           = databricks_group.platform_admins.display_name
 
   force_destroy = true
 }
@@ -82,6 +98,7 @@ module "catalog_dev" {
   storage_root = local.foundation.container_urls["managed-dev"]
   workspace_id = local.workspaces.workspace_ids["dev"]
   schemas      = var.schemas
+  owner        = databricks_group.platform_admins.display_name
 
   # dev is where work happens: engineers can create and modify, analysts read.
   #
@@ -113,6 +130,7 @@ module "catalog_prod" {
   storage_root = local.foundation.container_urls["managed-prod"]
   workspace_id = local.workspaces.workspace_ids["prod"]
   schemas      = var.schemas
+  owner        = databricks_group.platform_admins.display_name
 
   # prod is read-only for humans. Nobody gets MODIFY or CREATE_TABLE - production
   # data arrives through jobs running as a service principal, never through a
@@ -155,6 +173,37 @@ resource "databricks_group" "engineers" {
 resource "databricks_group" "analysts" {
   provider     = databricks.account
   display_name = "data-analysts"
+}
+
+# --- Ownership group ------------------------------------------------------
+#
+# Every Unity Catalog object was previously owned by Bhanu personally, because
+# whoever creates an object owns it. That breaks in two ways:
+#
+#   1. CI cannot manage what it does not own. Account admin governs the ACCOUNT;
+#      it grants nothing inside the metastore. The service principal could see
+#      external location names (BROWSE) and read nothing about them - which is
+#      exactly the error this fixes.
+#   2. A person leaves and their objects become unmanageable. In a real org this
+#      is discovered at the worst possible moment.
+#
+# Owning platform objects with a GROUP fixes both. Membership changes without
+# touching ownership, and no single human is load-bearing.
+resource "databricks_group" "platform_admins" {
+  provider     = databricks.account
+  display_name = "platform-admins"
+}
+
+resource "databricks_group_member" "platform_admin_me" {
+  provider  = databricks.account
+  group_id  = databricks_group.platform_admins.id
+  member_id = data.databricks_user.me.id
+}
+
+resource "databricks_group_member" "platform_admin_ci" {
+  provider  = databricks.account
+  group_id  = databricks_group.platform_admins.id
+  member_id = databricks_service_principal.ci.id
 }
 
 # Find yourself at account level so you can be put in a group.
