@@ -68,7 +68,7 @@ jobs:
         # governance is independent - it reads no other module's state - but it
         # runs last so a subscription-level guardrail is never applied before the
         # things it guards exist.
-        module: [foundation, workspace, unity-catalog, jobs, governance]
+        module: [infra/network, infra/foundation, infra/workspace, data/catalog, data/pipelines, infra/governance]
 
     defaults:
       run:
