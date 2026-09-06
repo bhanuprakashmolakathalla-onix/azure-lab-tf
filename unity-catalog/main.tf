@@ -20,9 +20,23 @@ data "terraform_remote_state" "workspace" {
   }
 }
 
+data "terraform_remote_state" "governance" {
+  backend = "azurerm"
+  config = {
+    resource_group_name  = "rg-terraform-state"
+    storage_account_name = var.state_storage_account_name
+    container_name       = "tfstate"
+    key                  = "governance.tfstate"
+    use_azuread_auth     = true
+  }
+}
+
 locals {
   foundation = data.terraform_remote_state.foundation.outputs
   workspaces = data.terraform_remote_state.workspace.outputs
+
+  # Numeric Databricks id of the CI principal, owned by governance.
+  ci_sp_id = data.terraform_remote_state.governance.outputs.ci_sp_id
 }
 
 # --- Metastore-level objects ---------------------------------------------
@@ -60,6 +74,21 @@ resource "databricks_storage_credential" "adls" {
   depends_on = [
     databricks_group_member.platform_admin_me,
     databricks_group_member.platform_admin_ci,
+    # The workspace ASSIGNMENTS matter as much as the membership, and they matter
+    # in both directions.
+    #
+    # On create: an account group is invisible inside a workspace until assigned,
+    # so ownership handed to an unassigned group locks everyone out (Day 8).
+    #
+    # On DESTROY, Terraform walks this graph backwards - so listing them here is
+    # what guarantees the assignments are torn down AFTER the objects that depend
+    # on them. Without it Terraform may legally remove the assignment first, lose
+    # its own access to the metastore, and strand a half-destroyed module.
+    #
+    # Destroy ordering is the half of a dependency graph nobody tests until the
+    # day they need it to work.
+    databricks_mws_permission_assignment.platform_admins_dev,
+    databricks_mws_permission_assignment.platform_admins_prod,
   ]
 }
 
@@ -113,7 +142,7 @@ module "catalog_dev" {
     # The pipeline identity needs dev too, not just prod. Easy to miss precisely
     # because prod is the one that feels like it needs guarding - but a job that
     # cannot write to dev is a job you cannot test before promoting it.
-    (databricks_service_principal.ci.application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
+    (var.ci_application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
   }
 
   depends_on = [databricks_external_location.layers]
@@ -148,7 +177,7 @@ module "catalog_prod" {
     # The only principal that can WRITE to production, and it is not a person.
     # Note it is keyed by APPLICATION ID - UC identifies service principals that
     # way, not by display name the way it does groups.
-    (databricks_service_principal.ci.application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
+    (var.ci_application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
   }
 
   # dev may read prod, never write to it. Note the asymmetry: catalog_dev grants
@@ -203,7 +232,7 @@ resource "databricks_group_member" "platform_admin_me" {
 resource "databricks_group_member" "platform_admin_ci" {
   provider  = databricks.account
   group_id  = databricks_group.platform_admins.id
-  member_id = databricks_service_principal.ci.id
+  member_id = local.ci_sp_id
 }
 
 # NOT OPTIONAL, and omitting it is how this group locked everyone out.
@@ -296,24 +325,9 @@ resource "databricks_mws_permission_assignment" "engineers_prod" {
 # Analysts are deliberately NOT assigned to prod. Three layers of "no", each
 # failing differently and each independently sufficient.
 
-# --- CI service principal -------------------------------------------------
-#
-# This creates a SECOND identity. The Entra service principal already exists;
-# this is its Databricks counterpart, and the two are linked only by
-# application_id. Three objects now represent one robot:
-#
-#   Entra application      399c031a-...  the global definition
-#   Entra service principal cecdbc56-... holds AZURE role assignments
-#   Databricks SP          (its own id)  holds DATABRICKS permissions and grants
-#
-# Mixing up which id a given API wants is the main friction here. UC GRANTS
-# reference a service principal by its APPLICATION ID, while workspace
-# assignment wants the Databricks SP's numeric id.
-resource "databricks_service_principal" "ci" {
-  provider       = databricks.account
-  application_id = var.ci_application_id
-  display_name   = "sp-terraform-lab"
-}
+# The CI service principal itself now lives in the governance module - it is
+# bootstrap identity and must survive a teardown of this one. See the Day 15
+# note there. Here we only reference it.
 
 # ADMIN, not USER. This identity has to manage clusters, jobs and permissions
 # inside both workspaces, which USER cannot do.
@@ -324,14 +338,14 @@ resource "databricks_service_principal" "ci" {
 resource "databricks_mws_permission_assignment" "ci_dev" {
   provider     = databricks.account
   workspace_id = local.workspaces.workspace_ids["dev"]
-  principal_id = databricks_service_principal.ci.id
+  principal_id = local.ci_sp_id
   permissions  = ["ADMIN"]
 }
 
 resource "databricks_mws_permission_assignment" "ci_prod" {
   provider     = databricks.account
   workspace_id = local.workspaces.workspace_ids["prod"]
-  principal_id = databricks_service_principal.ci.id
+  principal_id = local.ci_sp_id
   permissions  = ["ADMIN"]
 }
 
@@ -373,24 +387,3 @@ resource "databricks_access_control_rule_set" "ci_delegation" {
   }
 }
 
-# --- Account admin --------------------------------------------------------
-#
-# Account admin is a SCIM ROLE on the principal, not an entry in a rule set.
-# Rule sets govern access TO a resource (this service principal, this group);
-# account_admin is an attribute OF an identity. Different model, different
-# resource - `roles/account_admin` in a rule set is rejected as unsupported.
-#
-# The distinction matters beyond the syntax error, because this resource is
-# ADDITIVE and per-principal. There is no authoritative list to accidentally
-# omit yourself from, so the lockout risk that applies to
-# databricks_access_control_rule_set simply does not exist here.
-#
-# Why CI needs it: without account admin the service principal cannot manage
-# groups, workspace assignments, or delegation - so this module could never run
-# in CI, leaving the one that governs who can access what as the only module
-# with no review gate.
-resource "databricks_service_principal_role" "ci_account_admin" {
-  provider             = databricks.account
-  service_principal_id = databricks_service_principal.ci.id
-  role                 = "account_admin"
-}

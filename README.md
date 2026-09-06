@@ -46,15 +46,16 @@ Each directory is a **root module with its own state file**. They read each othe
 | `unity-catalog` | `unity-catalog.tfstate` | storage credential, external locations, catalogs, schemas, groups, grants, bindings |
 | `jobs` | `jobs.tfstate` | notebooks and the medallion job, per environment |
 | `compute` | `compute.tfstate` | cluster policy + an all-purpose cluster for ad-hoc work |
-| `governance` | `governance.tfstate` | subscription budget and alerts |
+| `governance` | `governance.tfstate` | subscription budget and alerts; the CI principal's Databricks identity |
 
 **Why separate state files rather than one?** Blast radius. A `terraform destroy` in `compute`
 physically cannot reach the lake, because the lake is not in that state file. The cost is
 losing a single `apply`; the benefit is that a bad day stays contained.
 
-`governance` is separate for a different reason: subscription guardrails must **outlive** a
-teardown of the lab. A budget that disappears with the resources it was watching is worse
-than no budget.
+`governance` is separate for a different reason: it holds what must **outlive** a teardown of
+the lab. A budget that vanishes with the resources it was watching is worse than no budget —
+and the service principal that *runs* Terraform must not be owned by state that Terraform
+destroys.
 
 ## Getting it running
 
@@ -77,8 +78,16 @@ cd ../jobs        ; terraform init ; terraform apply
 cd ../governance  ; terraform init ; terraform apply
 ```
 
-About 15 minutes from an empty subscription. `compute` is optional and costs money while it
-runs.
+`compute` is optional and costs money while it runs.
+
+**Measured by actually doing it**, not estimated:
+
+| | |
+|---|---|
+| Teardown — 4 modules, 64 resources | **12m41s** |
+| Rebuild from empty — 4 modules, ~70 resources | **~15 min** |
+
+The two workspaces dominate both directions, roughly 4 minutes each, in parallel.
 
 ## CI/CD
 
@@ -175,6 +184,12 @@ Decisions that mattered more than the numbers:
 - **`databricks_job` task blocks are a positional list**, and the API returns them sorted
   alphabetically. Config must match that order or every plan shows a diff that applies
   successfully and immediately returns.
+- **`databricks_service_principal` does not round-trip.** Its SCIM delete DEACTIVATES the
+  account record instead of removing it, so destroy-then-recreate collides with "already
+  exists" and leaves `run_as` pointing at an inactive principal. The fix is structural rather
+  than a workaround: an identity that *runs* Terraform belongs outside the state Terraform
+  destroys. Only a full rebuild drill surfaces this class of bug — every other operation had
+  worked for two weeks.
 - **`az` on Windows is a `.cmd` shim**, so `( ) < > | & ^` are live cmd metacharacters even
   inside PowerShell quotes. Keep JMESPath function calls out of `--query`.
 
