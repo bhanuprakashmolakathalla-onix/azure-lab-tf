@@ -13,3 +13,19 @@ variable "notebook_root" {
   type        = string
   default     = "/Shared/medallion"
 }
+
+variable "landing_url" {
+  description = "abfss:// URL of the landing container. Auto Loader watches a subdirectory of this."
+  type        = string
+}
+
+variable "checkpoints_url" {
+  description = "abfss:// URL for Auto Loader schema and commit state. Operational state, deliberately NOT in a medallion layer."
+  type        = string
+}
+
+variable "seed_batch" {
+  description = "Which simulated batch the seed task writes. Bump it to make new files appear, then re-run the job - Auto Loader should ingest ONLY the new batch."
+  type        = string
+  default     = "1"
+}

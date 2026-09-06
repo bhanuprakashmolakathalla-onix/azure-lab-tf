@@ -9,6 +9,20 @@ data "terraform_remote_state" "workspace" {
   }
 }
 
+# Auto Loader needs real abfss:// paths for the landing zone and its checkpoints.
+# Those come from the foundation module's container_urls output, so the storage
+# account name is never typed here - rename the account and this follows.
+data "terraform_remote_state" "foundation" {
+  backend = "azurerm"
+  config = {
+    resource_group_name  = "rg-terraform-state"
+    storage_account_name = var.state_storage_account_name
+    container_name       = "tfstate"
+    key                  = "foundation.tfstate"
+    use_azuread_auth     = true
+  }
+}
+
 # Both environments are deployed from ONE state file, each through its own
 # provider. This replaces the earlier `-var target_env=prod` approach, which was
 # wrong in a way worth remembering:
@@ -31,6 +45,9 @@ module "pipeline_dev" {
 
   env               = "dev"
   ci_application_id = var.ci_application_id
+  landing_url       = data.terraform_remote_state.foundation.outputs.container_urls["landing"]
+  checkpoints_url   = data.terraform_remote_state.foundation.outputs.container_urls["checkpoints"]
+  seed_batch        = var.seed_batch
 }
 
 module "pipeline_prod" {
@@ -42,6 +59,9 @@ module "pipeline_prod" {
 
   env               = "prod"
   ci_application_id = var.ci_application_id
+  landing_url       = data.terraform_remote_state.foundation.outputs.container_urls["landing"]
+  checkpoints_url   = data.terraform_remote_state.foundation.outputs.container_urls["checkpoints"]
+  seed_batch        = var.seed_batch
 }
 
 # `moved` blocks: refactor without destroying.

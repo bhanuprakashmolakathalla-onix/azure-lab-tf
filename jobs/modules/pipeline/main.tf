@@ -1,5 +1,8 @@
 locals {
-  layers = ["bronze", "silver", "gold"]
+  # seed_landing is not a medallion layer - it fakes an upstream system dropping
+  # files into the landing zone, so Auto Loader has something to discover. On a
+  # real platform this task does not exist; files arrive from elsewhere.
+  layers = ["seed_landing", "bronze", "silver", "gold"]
 }
 
 # Create the parent folder explicitly.
@@ -74,9 +77,17 @@ resource "databricks_job" "medallion" {
     task_key        = "bronze"
     job_cluster_key = "pipeline"
 
+    depends_on {
+      task_key = "seed"
+    }
+
     notebook_task {
-      notebook_path   = databricks_notebook.layer["bronze"].path
-      base_parameters = { catalog = var.env }
+      notebook_path = databricks_notebook.layer["bronze"].path
+      base_parameters = {
+        catalog         = var.env
+        landing_url     = var.landing_url
+        checkpoints_url = var.checkpoints_url
+      }
     }
   }
 
@@ -105,6 +116,25 @@ resource "databricks_job" "medallion" {
     notebook_task {
       notebook_path   = databricks_notebook.layer["gold"].path
       base_parameters = { catalog = var.env }
+    }
+  }
+
+  # Listed between gold and silver only because task blocks must appear in the
+  # order the API returns them - alphabetically by task_key. Execution order is
+  # seed -> bronze -> silver -> gold, set by the depends_on blocks.
+  task {
+    task_key        = "seed"
+    job_cluster_key = "pipeline"
+
+    notebook_task {
+      notebook_path = databricks_notebook.layer["seed_landing"].path
+      base_parameters = {
+        landing_url = var.landing_url
+        # Bump this between runs to simulate new files arriving. Auto Loader
+        # should pick up ONLY the new batch - that is the whole demonstration.
+        batch         = var.seed_batch
+        total_batches = "4"
+      }
     }
   }
 
