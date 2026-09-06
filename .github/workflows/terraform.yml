@@ -58,17 +58,29 @@ jobs:
       max-parallel: 1
       fail-fast: true
       matrix:
-        # Dependency order, and it is load-bearing. unity-catalog reads the
-        # workspace module's outputs, and jobs reads them too - so unity-catalog
-        # must sit after workspace. It goes before jobs by convention rather than
-        # necessity: govern access first, then deploy things that use it.
+        # Dependency order, and it is load-bearing. workspace reads foundation;
+        # everything downstream reads workspace.
         #
-        # `compute` is deliberately absent. It starts a cluster, and a merge to
-        # main should not begin billing DBUs.
-        # governance is independent - it reads no other module's state - but it
-        # runs last so a subscription-level guardrail is never applied before the
-        # things it guards exist.
-        module: [infra/network, infra/foundation, infra/workspace, data/catalog, data/pipelines, infra/governance]
+        # `compute` is deliberately absent: it starts a cluster, and a merge to
+        # main should not begin billing DBUs. governance is independent - it
+        # reads no other module state - but runs last so a subscription-level
+        # guardrail is never applied before the things it guards exist.
+        #
+        # data/catalog AND data/pipelines ARE DELIBERATELY ABSENT, and this is
+        # not a temporary omission.
+        #
+        # Both use the `databricks` provider, whose host is the workspace URL.
+        # Since public_network_access_enabled = false, that name resolves only
+        # inside the transit or workspace VNet. A GitHub-HOSTED runner is on
+        # Microsoft public infrastructure, outside both, so those modules cannot
+        # run there - not slowly, not with a token, not at all.
+        #
+        # The real fix is a SELF-HOSTED runner inside the VNet, which is exactly
+        # why regulated organisations run their own runner fleets. Until then
+        # those two modules are applied from the jumpbox by hand, and CI covers
+        # only the azurerm modules, which reach ARM over the public internet and
+        # are unaffected.
+        module: [infra/network, infra/foundation, infra/workspace, infra/governance]
 
     defaults:
       run:

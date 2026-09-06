@@ -16,8 +16,7 @@
 # come up; serverless takes seconds, which is the difference between an API that
 # feels broken after idling and one that feels slow for a moment.
 resource "databricks_sql_endpoint" "serving" {
-  provider = databricks.dev
-  count    = var.serving_compute == "warehouse" ? 1 : 0
+  count = var.serving_compute == "warehouse" ? 1 : 0
 
   name                      = "wh-serving-2xs"
   cluster_size              = "2X-Small"
@@ -55,12 +54,11 @@ resource "databricks_sql_endpoint" "serving" {
 # Catalog access under that principal. Nobody else can attach to it - which for
 # a serving cluster is a feature.
 resource "databricks_cluster" "serving" {
-  provider = databricks.dev
-  count    = var.serving_compute == "cluster" ? 1 : 0
+  count = var.serving_compute == "cluster" ? 1 : 0
 
-  cluster_name  = "serving-taxi-api"
+  cluster_name  = "serving-fashion"
   spark_version = data.databricks_spark_version.lts.id
-  node_type_id  = data.databricks_node_type.smallest.id
+  node_type_id  = var.node_type_id
   num_workers   = 0
 
   # Twenty minutes. Longer than the warehouse's ten because the restart penalty
@@ -81,16 +79,7 @@ resource "databricks_cluster" "serving" {
   single_user_name   = azurerm_user_assigned_identity.app.client_id
 }
 
-data "databricks_node_type" "smallest" {
-  provider      = databricks.dev
-  local_disk    = true
-  min_cores     = 4
-  min_memory_gb = 8
-  category      = "General Purpose"
-}
-
 data "databricks_spark_version" "lts" {
-  provider          = databricks.dev
   long_term_support = true
 }
 
@@ -100,7 +89,7 @@ locals {
   serving_http_path = var.serving_compute == "warehouse" ? (
     databricks_sql_endpoint.serving[0].odbc_params[0].path
     ) : (
-    "/sql/protocolv1/o/${data.terraform_remote_state.workspace.outputs.workspace_ids["dev"]}/${databricks_cluster.serving[0].id}"
+    "/sql/protocolv1/o/${local.ws.workspace_id}/${databricks_cluster.serving[0].id}"
   )
 }
 
@@ -119,14 +108,14 @@ resource "databricks_service_principal" "app" {
   provider = databricks.account
 
   application_id = azurerm_user_assigned_identity.app.client_id
-  display_name   = "sp-taxi-api"
+  display_name   = "sp-fashion-app"
 }
 
 # Gate 2: may it enter the workspace at all. USER, not ADMIN - it reads one
 # table and needs nothing else.
-resource "databricks_mws_permission_assignment" "app_dev" {
+resource "databricks_mws_permission_assignment" "app" {
   provider     = databricks.account
-  workspace_id = data.terraform_remote_state.workspace.outputs.workspace_ids["dev"]
+  workspace_id = local.ws.workspace_id
   principal_id = databricks_service_principal.app.id
   permissions  = ["USER"]
 }
@@ -135,7 +124,6 @@ resource "databricks_mws_permission_assignment" "app_dev" {
 # principal can hold SELECT on every table and still be unable to run a query,
 # because compute permission and data permission are different systems.
 resource "databricks_permissions" "warehouse" {
-  provider        = databricks.dev
   count           = var.serving_compute == "warehouse" ? 1 : 0
   sql_endpoint_id = databricks_sql_endpoint.serving[0].id
 
@@ -144,7 +132,7 @@ resource "databricks_permissions" "warehouse" {
     permission_level       = "CAN_USE"
   }
 
-  depends_on = [databricks_mws_permission_assignment.app_dev]
+  depends_on = [databricks_mws_permission_assignment.app]
 }
 
 # Same gate, cluster flavour - and the level matters more than it looks.
@@ -162,7 +150,6 @@ resource "databricks_permissions" "warehouse" {
 # cluster, or a serverless warehouse (which has no start to authorise),
 # CAN_ATTACH_TO would be correct and genuinely least-privilege.
 resource "databricks_permissions" "cluster" {
-  provider   = databricks.dev
   count      = var.serving_compute == "cluster" ? 1 : 0
   cluster_id = databricks_cluster.serving[0].id
 
@@ -171,7 +158,7 @@ resource "databricks_permissions" "cluster" {
     permission_level       = "CAN_RESTART"
   }
 
-  depends_on = [databricks_mws_permission_assignment.app_dev]
+  depends_on = [databricks_mws_permission_assignment.app]
 }
 
 # Gate 4: what it may read.
@@ -192,16 +179,14 @@ resource "databricks_permissions" "cluster" {
 # business reading bronze or silver. Granting at catalog level would silently
 # widen its access every time a schema is added.
 resource "databricks_grant" "gold_catalog" {
-  provider   = databricks.dev
   catalog    = var.catalog
   principal  = azurerm_user_assigned_identity.app.client_id
   privileges = ["USE_CATALOG"] # traversal only - no data access
 
-  depends_on = [databricks_mws_permission_assignment.app_dev]
+  depends_on = [databricks_mws_permission_assignment.app]
 }
 
 resource "databricks_grant" "gold_schema" {
-  provider   = databricks.dev
   schema     = "${var.catalog}.gold"
   principal  = azurerm_user_assigned_identity.app.client_id
   privileges = ["USE_SCHEMA", "SELECT"]

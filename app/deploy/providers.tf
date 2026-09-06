@@ -19,16 +19,20 @@ provider "azurerm" {
   resource_provider_registrations = "none"
 }
 
-# Workspace-scoped: the SQL warehouse, its permissions, and the UC grants.
+# Workspace-scoped: the serving compute, its permissions, and the UC grants.
+#
+# WHERE THIS RUNS: this host resolves only inside the transit or workspace VNet,
+# so this module - unlike every other azurerm module - must run from the jumpbox.
+# One databricks provider is enough to pin the whole module to that machine.
 provider "databricks" {
-  alias                       = "dev"
-  host                        = data.terraform_remote_state.workspace.outputs.workspace_hosts["dev"]
-  azure_workspace_resource_id = data.terraform_remote_state.workspace.outputs.workspace_resource_ids["dev"]
+  host                        = data.terraform_remote_state.workspace.outputs.workspace_host
+  azure_workspace_resource_id = data.terraform_remote_state.workspace.outputs.workspace_resource_id
 }
 
 # Account-scoped: registering the app's managed identity as a Databricks service
-# principal, and assigning it into the workspace. Identity is always account-level
-# once Unity Catalog is on - the Day 4 rule, applying to a robot this time.
+# principal, and assigning it into the workspace. Identity is always
+# account-level once Unity Catalog is on - the same rule as for humans, applied
+# to a robot.
 provider "databricks" {
   alias           = "account"
   host            = "https://accounts.azuredatabricks.net"

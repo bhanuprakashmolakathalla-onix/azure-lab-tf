@@ -203,3 +203,8 @@ def table(headers, rows, unit_cols=()):
         )
         body.append(f"<tr>{cells}</tr>")
     return f"<table class='data'><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
+
+
+# Public alias. main.py formats the KPI tiles with the same rules the charts use,
+# so a tile and its axis never disagree about what "1.2L" means.
+fmt = _fmt

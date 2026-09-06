@@ -23,62 +23,23 @@ data "terraform_remote_state" "foundation" {
   }
 }
 
-# Both environments are deployed from ONE state file, each through its own
-# provider. This replaces the earlier `-var target_env=prod` approach, which was
-# wrong in a way worth remembering:
+# One pipeline now. The earlier build instantiated this module twice, once per
+# workspace, to make the point that provider selection is STRUCTURAL - a variable
+# may change what a resource looks like, never which provider manages it. That
+# lesson still holds; there is simply one workspace to point at.
 #
-# A single state file records which workspace each object lives in. Flipping a
-# variable repointed the provider at prod while state still described dev
-# objects, and the provider refused with a workspace_id mismatch. It was right to.
-#
-# The general rule: a variable may change what a resource LOOKS like, never which
-# PROVIDER manages it. Provider selection is structural, so it belongs in module
-# instantiation. The alternatives are separate state files per environment
-# (via -backend-config at init) or terraform workspaces; module-per-environment
-# is the one that keeps a single plan showing both.
-module "pipeline_dev" {
+# NOTE the checkpoints URL is a separate container, not a folder inside bronze.
+# Auto Loader state is operational state, not data: it has a different lifecycle
+# from every table, and a `DROP TABLE` must not be able to orphan it. Putting it
+# under a medallion layer is a mistake that only shows up the day someone cleans
+# up a layer and the next run silently re-ingests everything.
+module "pipeline" {
   source = "./modules/pipeline"
 
-  providers = {
-    databricks = databricks.dev
-  }
-
-  env               = "dev"
+  catalog           = var.catalog
   ci_application_id = var.ci_application_id
   landing_url       = data.terraform_remote_state.foundation.outputs.container_urls["landing"]
   checkpoints_url   = data.terraform_remote_state.foundation.outputs.container_urls["checkpoints"]
-  seed_batch        = var.seed_batch
-}
-
-module "pipeline_prod" {
-  source = "./modules/pipeline"
-
-  providers = {
-    databricks = databricks.prod
-  }
-
-  env               = "prod"
-  ci_application_id = var.ci_application_id
-  landing_url       = data.terraform_remote_state.foundation.outputs.container_urls["landing"]
-  checkpoints_url   = data.terraform_remote_state.foundation.outputs.container_urls["checkpoints"]
-  seed_batch        = var.seed_batch
-}
-
-# `moved` blocks: refactor without destroying.
-#
-# The dev notebooks and job already exist and are recorded in state at their old
-# top-level addresses. Extracting them into a module changes the ADDRESS, and
-# without these Terraform would read that as "delete four things, create four
-# new ones" - losing the job id, its run history, and anything referencing it.
-#
-# These tell Terraform the objects simply moved. No API calls, pure state
-# surgery, and safe to delete once applied.
-moved {
-  from = databricks_notebook.layer
-  to   = module.pipeline_dev.databricks_notebook.layer
-}
-
-moved {
-  from = databricks_job.medallion
-  to   = module.pipeline_dev.databricks_job.medallion
+  start_date        = var.start_date
+  num_days          = var.num_days
 }

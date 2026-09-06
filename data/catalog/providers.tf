@@ -1,16 +1,19 @@
-# TWO aliased databricks providers - one per workspace.
+# TWO providers, and the split is the important part.
 #
-# This is a direct consequence of what we are about to build. A catalog with
-# isolation_mode = "ISOLATED" is invisible from any workspace it is not bound to,
-# and that applies to TERRAFORM exactly as it applies to a human. A provider
-# pointed at the dev workspace cannot create a schema inside a prod-bound
-# catalog; the API returns "catalog does not exist", which reads like a typo.
+# The first talks to a WORKSPACE. The second talks to the ACCOUNT, which is where
+# identity lives once Unity Catalog is on: users, groups and service principals
+# are account-level objects that get ASSIGNED into workspaces, never created in
+# them. That is the shape people get wrong coming from the pre-UC world, where
+# every workspace had its own user list. A workspace-local group is a legacy
+# object now, and a grant referencing one will not resolve at the metastore.
 #
-# So isolation is not only a security control. It changes the shape of the code
-# that manages it. Most people discover this the hard way, halfway through an
-# apply that half-succeeded.
+# WHERE THIS RUNS: the workspace provider's host resolves only inside the transit
+# or workspace VNet. This module therefore runs from the jumpbox and nowhere
+# else - not from the laptop, not from a GitHub-hosted runner. That is the direct,
+# unavoidable cost of public_network_access_enabled = false, and it is why
+# regulated shops run self-hosted runners.
 #
-# Both aliases still authenticate from your `az login` - no tokens, no secrets.
+# Both authenticate from `az login`. No tokens, no secrets, nothing to rotate.
 
 terraform {
   required_version = ">= 1.9.0"
@@ -24,31 +27,10 @@ terraform {
 }
 
 provider "databricks" {
-  alias                       = "dev"
-  host                        = data.terraform_remote_state.workspace.outputs.workspace_hosts["dev"]
-  azure_workspace_resource_id = data.terraform_remote_state.workspace.outputs.workspace_resource_ids["dev"]
+  host                        = data.terraform_remote_state.workspace.outputs.workspace_host
+  azure_workspace_resource_id = data.terraform_remote_state.workspace.outputs.workspace_resource_id
 }
 
-provider "databricks" {
-  alias                       = "prod"
-  host                        = data.terraform_remote_state.workspace.outputs.workspace_hosts["prod"]
-  azure_workspace_resource_id = data.terraform_remote_state.workspace.outputs.workspace_resource_ids["prod"]
-}
-
-# A THIRD provider, and a different kind of thing entirely.
-#
-# The dev/prod aliases talk to a WORKSPACE. This one talks to the ACCOUNT, which
-# is where identity lives once Unity Catalog is on: users, groups and service
-# principals are account-level objects, assigned INTO workspaces rather than
-# created in them.
-#
-# That is the split people get wrong coming from the pre-UC world, where every
-# workspace had its own user list. Now a workspace-local group is a legacy shape
-# and grants that reference one will not resolve at the metastore.
-#
-# Note the host is accounts.azuredatabricks.net, not a workspace URL, and it
-# needs account_id instead of azure_workspace_resource_id. Auth is still your
-# `az login`.
 provider "databricks" {
   alias      = "account"
   host       = "https://accounts.azuredatabricks.net"
@@ -59,8 +41,8 @@ provider "databricks" {
   # not exist - AADSTS70011. Exactly the same failure as signing into the account
   # console with the raw gmail address.
   #
-  # The workspace-scoped providers never hit this because
-  # azure_workspace_resource_id carries the tenant inside the ARM path.
-  # account_id carries no tenant, so it has to be stated.
+  # The workspace provider never hits this because azure_workspace_resource_id
+  # carries the tenant inside the ARM path. account_id carries no tenant, so it
+  # has to be stated.
   azure_tenant_id = var.azure_tenant_id
 }

@@ -1,3 +1,14 @@
+# Unity Catalog for the fashion platform: one catalog, three layers, grants that
+# mean something.
+#
+# CHANGED FROM THE DEV/PROD BUILD. There is one workspace now, so the two-catalog
+# isolation experiment is gone. What is NOT gone is isolation_mode = ISOLATED on
+# the catalog: a metastore is REGION-WIDE, so any workspace attached to it later
+# sees every OPEN catalog by default. ISOLATED means deny-by-default, and the
+# binding below is the single explicit exception. Worth keeping even with one
+# workspace, because the failure it prevents is somebody else's future workspace,
+# not yours.
+
 data "terraform_remote_state" "foundation" {
   backend = "azurerm"
   config = {
@@ -32,168 +43,19 @@ data "terraform_remote_state" "governance" {
 }
 
 locals {
-  foundation = data.terraform_remote_state.foundation.outputs
-  workspaces = data.terraform_remote_state.workspace.outputs
+  foundation   = data.terraform_remote_state.foundation.outputs
+  workspace_id = data.terraform_remote_state.workspace.outputs.workspace_id
 
-  # Numeric Databricks id of the CI principal, owned by governance.
+  # Numeric Databricks id of the CI principal, owned by governance so it survives
+  # a teardown of this module.
   ci_sp_id = data.terraform_remote_state.governance.outputs.ci_sp_id
-}
-
-# --- Metastore-level objects ---------------------------------------------
-#
-# The storage credential and external locations are METASTORE-scoped, not
-# workspace-scoped. They only need to be created once, through any workspace -
-# we use dev. Their own isolation_mode is left at the default (OPEN) so that both
-# catalogs can build on them.
-#
-# Tightening these too is a real option on a production platform: an external
-# location can be isolated and bound just like a catalog. Left open here so the
-# experiment isolates ONE variable - the catalog.
-resource "databricks_storage_credential" "adls" {
-  provider = databricks.dev
-
-  name    = "sc-lab01-adls"
-  comment = "Managed identity for the lab lake. Managed by Terraform."
-
-  # Group, never a person. See the platform_admins comment above.
-  owner = databricks_group.platform_admins.display_name
-
-  azure_managed_identity {
-    access_connector_id = local.foundation.access_connector_id
-  }
-
-  force_destroy = true
-
-  # NOT redundant. Terraform's implicit dependencies follow REFERENCES, and
-  # `owner` above references the group's display_name - not its membership. So
-  # without this, Terraform may legally hand ownership to platform-admins BEFORE
-  # anyone is in it, and the apply loses its own permissions half way through.
-  #
-  # Everything else chains off this: external locations reference the credential,
-  # and the catalog modules depend on the external locations.
-  depends_on = [
-    databricks_group_member.platform_admin_me,
-    databricks_group_member.platform_admin_ci,
-    # The workspace ASSIGNMENTS matter as much as the membership, and they matter
-    # in both directions.
-    #
-    # On create: an account group is invisible inside a workspace until assigned,
-    # so ownership handed to an unassigned group locks everyone out (Day 8).
-    #
-    # On DESTROY, Terraform walks this graph backwards - so listing them here is
-    # what guarantees the assignments are torn down AFTER the objects that depend
-    # on them. Without it Terraform may legally remove the assignment first, lose
-    # its own access to the metastore, and strand a half-destroyed module.
-    #
-    # Destroy ordering is the half of a dependency graph nobody tests until the
-    # day they need it to work.
-    databricks_mws_permission_assignment.platform_admins_dev,
-    databricks_mws_permission_assignment.platform_admins_prod,
-  ]
-}
-
-resource "databricks_external_location" "layers" {
-  provider = databricks.dev
-  for_each = local.foundation.container_urls
-
-  name            = "el-lab01-${each.key}"
-  url             = each.value
-  credential_name = databricks_storage_credential.adls.name
-  comment         = "Lab lake: ${each.key}"
-  owner           = databricks_group.platform_admins.display_name
-
-  force_destroy = true
-}
-
-# --- One catalog per environment, each through ITS OWN provider -----------
-#
-# Same module, twice, with a different provider alias passed in each time. This
-# is the pattern that makes isolation manageable: dev's objects are created
-# through the dev workspace, prod's through prod, because an ISOLATED catalog is
-# invisible from anywhere it is not bound.
-#
-# Terraform cannot select a provider dynamically from a for_each key, which is
-# exactly why this is two module calls rather than one keyed resource. That
-# limitation is not a wart - it is what forces the provider choice to be explicit
-# and reviewable in the diff.
-module "catalog_dev" {
-  source = "./modules/catalog"
-
-  providers = {
-    databricks = databricks.dev
-  }
-
-  name         = "dev"
-  storage_root = local.foundation.container_urls["managed-dev"]
-  workspace_id = local.workspaces.workspace_ids["dev"]
-  schemas      = var.schemas
-  owner        = databricks_group.platform_admins.display_name
-
-  # dev is where work happens: engineers can create and modify, analysts read.
-  #
-  # USE_CATALOG is the one everybody forgets. It grants NO data access on its own
-  # - it is the right to traverse into the catalog at all. Without it, SELECT on
-  # a table beneath is unreachable and the error says the table does not exist.
-  # Three levels, three traversal grants: USE_CATALOG, USE_SCHEMA, then SELECT.
-  catalog_grants = {
-    (databricks_group.engineers.display_name) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"]
-    (databricks_group.analysts.display_name)  = ["USE_CATALOG", "USE_SCHEMA", "SELECT"]
-
-    # The pipeline identity needs dev too, not just prod. Easy to miss precisely
-    # because prod is the one that feels like it needs guarding - but a job that
-    # cannot write to dev is a job you cannot test before promoting it.
-    (var.ci_application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
-  }
-
-  depends_on = [databricks_external_location.layers]
-}
-
-module "catalog_prod" {
-  source = "./modules/catalog"
-
-  providers = {
-    databricks = databricks.prod
-  }
-
-  name         = "prod"
-  storage_root = local.foundation.container_urls["managed-prod"]
-  workspace_id = local.workspaces.workspace_ids["prod"]
-  schemas      = var.schemas
-  owner        = databricks_group.platform_admins.display_name
-
-  # prod is read-only for humans. Nobody gets MODIFY or CREATE_TABLE - production
-  # data arrives through jobs running as a service principal, never through a
-  # person at a keyboard.
-  #
-  # Note this is the SECOND, independent layer. The READ_ONLY binding below
-  # already makes writes from the dev workspace impossible for everyone; this
-  # makes writes impossible for these groups from ANY workspace. Belt and braces,
-  # and they fail differently - the binding says "no such catalog", the grant
-  # says "permission denied".
-  catalog_grants = {
-    (databricks_group.engineers.display_name) = ["USE_CATALOG", "USE_SCHEMA", "SELECT"]
-    (databricks_group.analysts.display_name)  = ["USE_CATALOG", "USE_SCHEMA", "SELECT"]
-
-    # The only principal that can WRITE to production, and it is not a person.
-    # Note it is keyed by APPLICATION ID - UC identifies service principals that
-    # way, not by display name the way it does groups.
-    (var.ci_application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
-  }
-
-  # dev may read prod, never write to it. Note the asymmetry: catalog_dev grants
-  # prod no reciprocal access, so production cannot depend on dev data by accident.
-  read_only_workspace_ids = {
-    dev = local.workspaces.workspace_ids["dev"]
-  }
-
-  depends_on = [databricks_external_location.layers]
 }
 
 # --- Account-level identity ----------------------------------------------
 #
-# Two groups, deliberately named for ROLES rather than people or teams. Grants
-# attach to groups and membership changes without touching the grant graph -
-# which is the only way this stays maintainable past about five people.
+# Groups named for ROLES, not people. Grants attach to groups, membership moves
+# underneath, and the grant graph stops needing edits every time someone joins.
+
 resource "databricks_group" "engineers" {
   provider     = databricks.account
   display_name = "data-engineers"
@@ -206,21 +68,18 @@ resource "databricks_group" "analysts" {
 
 # --- Ownership group ------------------------------------------------------
 #
-# Every Unity Catalog object was previously owned by Bhanu personally, because
-# whoever creates an object owns it. That breaks in two ways:
-#
-#   1. CI cannot manage what it does not own. Account admin governs the ACCOUNT;
-#      it grants nothing inside the metastore. The service principal could see
-#      external location names (BROWSE) and read nothing about them - which is
-#      exactly the error this fixes.
-#   2. A person leaves and their objects become unmanageable. In a real org this
-#      is discovered at the worst possible moment.
-#
-# Owning platform objects with a GROUP fixes both. Membership changes without
-# touching ownership, and no single human is load-bearing.
+# Whoever creates a UC object owns it, so without this everything is owned by
+# Bhanu personally. That breaks twice: CI cannot manage what it does not own
+# (account admin governs the ACCOUNT and grants nothing inside the metastore),
+# and a person leaving makes their objects unmanageable.
 resource "databricks_group" "platform_admins" {
   provider     = databricks.account
   display_name = "platform-admins"
+}
+
+data "databricks_user" "me" {
+  provider  = databricks.account
+  user_name = var.owner_user_name
 }
 
 resource "databricks_group_member" "platform_admin_me" {
@@ -235,44 +94,6 @@ resource "databricks_group_member" "platform_admin_ci" {
   member_id = local.ci_sp_id
 }
 
-# NOT OPTIONAL, and omitting it is how this group locked everyone out.
-#
-# An account-level group is invisible inside a workspace until it is ASSIGNED
-# there. Membership still exists at the account, but a workspace-scoped token
-# does not carry the group, so:
-#
-#   - ownership-by-group does not apply to you in that workspace
-#   - and if that group owns the objects, you cannot read your own metastore
-#
-# Which is exactly what happened: the owner transfer succeeded, and every
-# principal instantly lost access to the objects because nobody's workspace
-# identity included platform-admins.
-#
-# Same rule as Day 4 (identity -> assignment -> grants); this is the assignment
-# step again, one level up, applied to ownership instead of privileges.
-#
-# ADMIN rather than USER: this group owns the platform's UC objects and is the
-# identity CI operates as, so it needs to administer both workspaces.
-resource "databricks_mws_permission_assignment" "platform_admins_dev" {
-  provider     = databricks.account
-  workspace_id = local.workspaces.workspace_ids["dev"]
-  principal_id = databricks_group.platform_admins.id
-  permissions  = ["ADMIN"]
-}
-
-resource "databricks_mws_permission_assignment" "platform_admins_prod" {
-  provider     = databricks.account
-  workspace_id = local.workspaces.workspace_ids["prod"]
-  principal_id = databricks_group.platform_admins.id
-  permissions  = ["ADMIN"]
-}
-
-# Find yourself at account level so you can be put in a group.
-data "databricks_user" "me" {
-  provider  = databricks.account
-  user_name = var.owner_user_name
-}
-
 resource "databricks_group_member" "me_engineer" {
   provider  = databricks.account
   group_id  = databricks_group.engineers.id
@@ -281,103 +102,173 @@ resource "databricks_group_member" "me_engineer" {
 
 # --- Workspace assignment -------------------------------------------------
 #
-# The step that is easy to miss, because everything looks correct without it.
+# The step that is easy to miss because everything looks correct without it.
+# Three independent systems, and all three are required:
 #
-# An account-level group with catalog grants still cannot LOG IN to a workspace.
-# Identity, assignment and authorization are three independent systems:
+#   databricks_group              -> the principal exists in the account
+#   databricks_mws_permission_... -> it may ENTER this workspace     <- THIS
+#   databricks_grants             -> what it may touch once inside
 #
-#   databricks_group                -> the principal exists in the account
-#   databricks_mws_permission_...   -> it may enter this workspace   <- THIS
-#   databricks_grants               -> what it may touch once inside
+# Miss the middle one and grants are inert: correct privileges on a catalog the
+# principal can never reach. Worse, ownership handed to an UNASSIGNED group locks
+# everyone out, which is exactly how Day 8 broke - the transfer succeeded and
+# every principal instantly lost access, because nobody's workspace identity
+# carried platform-admins.
 #
-# Miss the middle one and grants are inert: perfectly correct privileges on a
-# catalog the user can never reach. The symptom is a user who "has access" per
-# the catalog UI but cannot open the workspace.
-#
-# GCP has no real equivalent - an IAM binding on a BigQuery dataset is sufficient
-# on its own. Databricks separates them because a workspace is a tenancy boundary,
-# not just a permissions scope.
-resource "databricks_mws_permission_assignment" "engineers_dev" {
+# GCP has no equivalent. An IAM binding on a BigQuery dataset is sufficient on
+# its own; there is no "may this principal enter the project" step. Databricks
+# splits them because a workspace is a TENANCY boundary, not just a permission
+# scope.
+resource "databricks_mws_permission_assignment" "platform_admins" {
   provider     = databricks.account
-  workspace_id = local.workspaces.workspace_ids["dev"]
+  workspace_id = local.workspace_id
+  principal_id = databricks_group.platform_admins.id
+  permissions  = ["ADMIN"]
+}
+
+resource "databricks_mws_permission_assignment" "engineers" {
+  provider     = databricks.account
+  workspace_id = local.workspace_id
   principal_id = databricks_group.engineers.id
   permissions  = ["USER"]
 }
 
-resource "databricks_mws_permission_assignment" "analysts_dev" {
+resource "databricks_mws_permission_assignment" "analysts" {
   provider     = databricks.account
-  workspace_id = local.workspaces.workspace_ids["dev"]
+  workspace_id = local.workspace_id
   principal_id = databricks_group.analysts.id
   permissions  = ["USER"]
 }
 
-# Engineers get prod too - but note what that does NOT give them. The prod
-# catalog grants withhold MODIFY and CREATE_TABLE, and the READ_ONLY binding
-# blocks writes from the dev workspace entirely. Workspace access is the right to
-# walk in the door, nothing more.
-resource "databricks_mws_permission_assignment" "engineers_prod" {
+# ADMIN, not USER: CI manages clusters, jobs and permissions inside the
+# workspace, which USER cannot do. Note the asymmetry with humans - platform
+# changes go through a reviewed pipeline running as this principal, not through
+# someone's console.
+resource "databricks_mws_permission_assignment" "ci" {
   provider     = databricks.account
-  workspace_id = local.workspaces.workspace_ids["prod"]
-  principal_id = databricks_group.engineers.id
-  permissions  = ["USER"]
+  workspace_id = local.workspace_id
+  principal_id = local.ci_sp_id
+  permissions  = ["ADMIN"]
 }
 
-# Analysts are deliberately NOT assigned to prod. Three layers of "no", each
-# failing differently and each independently sufficient.
-
-# The CI service principal itself now lives in the governance module - it is
-# bootstrap identity and must survive a teardown of this one. See the Day 15
-# note there. Here we only reference it.
-
-# ADMIN, not USER. This identity has to manage clusters, jobs and permissions
-# inside both workspaces, which USER cannot do.
+# --- Metastore-scoped storage --------------------------------------------
 #
-# Worth noticing the asymmetry with humans: no PERSON is a workspace admin in
-# prod, but the robot is. That is the point - production changes go through a
-# reviewed pipeline running as this principal, not through someone's console.
-resource "databricks_mws_permission_assignment" "ci_dev" {
-  provider     = databricks.account
-  workspace_id = local.workspaces.workspace_ids["dev"]
-  principal_id = local.ci_sp_id
-  permissions  = ["ADMIN"]
+# The storage credential and external locations are METASTORE-scoped, not
+# workspace-scoped - created once, through any workspace.
+#
+# THE PRIVATE-NETWORKING CATCH: creating a storage credential triggers a
+# validation that runs from the Databricks CONTROL PLANE, outside your VNet. It
+# reaches the lake over the public endpoint, which the foundation firewall denies
+# to everything except the Access Connector named in private_link_access. That
+# exception is the only reason this resource can be created at all against a
+# closed storage account, and it is why foundation uses network_rules with
+# default_action = Deny rather than public_network_access_enabled = false.
+resource "databricks_storage_credential" "adls" {
+  name    = "sc-lab01-adls"
+  comment = "Managed identity for the fashion lake. Managed by Terraform."
+
+  # Group, never a person.
+  owner = databricks_group.platform_admins.display_name
+
+  azure_managed_identity {
+    access_connector_id = local.foundation.access_connector_id
+  }
+
+  force_destroy = true
+
+  # NOT redundant. Terraform implicit dependencies follow REFERENCES, and `owner`
+  # references the group display_name - not its membership, and not its workspace
+  # assignment. Without this, Terraform may legally hand ownership to
+  # platform-admins BEFORE anyone is in it or it can enter the workspace, and the
+  # apply loses its own permissions half way through.
+  #
+  # On DESTROY Terraform walks this graph backwards, so listing the assignment
+  # here is also what guarantees it is torn down AFTER the objects that depend on
+  # it. Destroy ordering is the half of a dependency graph nobody tests until the
+  # day they need it.
+  depends_on = [
+    databricks_group_member.platform_admin_me,
+    databricks_group_member.platform_admin_ci,
+    databricks_mws_permission_assignment.platform_admins,
+  ]
 }
 
-resource "databricks_mws_permission_assignment" "ci_prod" {
-  provider     = databricks.account
-  workspace_id = local.workspaces.workspace_ids["prod"]
-  principal_id = local.ci_sp_id
-  permissions  = ["ADMIN"]
+resource "databricks_external_location" "layers" {
+  for_each = local.foundation.container_urls
+
+  name            = "el-lab01-${each.key}"
+  url             = each.value
+  credential_name = databricks_storage_credential.adls.name
+  comment         = "Fashion lake: ${each.key}"
+  owner           = databricks_group.platform_admins.display_name
+
+  force_destroy = true
+}
+
+# --- The catalog ----------------------------------------------------------
+
+module "catalog" {
+  source = "./modules/catalog"
+
+  providers = {
+    databricks = databricks
+  }
+
+  name         = var.catalog_name
+  storage_root = local.foundation.container_urls["managed"]
+  workspace_id = local.workspace_id
+  schemas      = var.schemas
+  owner        = databricks_group.platform_admins.display_name
+
+  # USE_CATALOG is the one everybody forgets. It grants NO data access on its own
+  # - it is the right to TRAVERSE into the catalog. Without it, SELECT on a table
+  # beneath is unreachable and the error claims the table does not exist. Three
+  # levels, three traversal grants: USE_CATALOG, USE_SCHEMA, then SELECT.
+  #
+  # Grants also INHERIT downward: SELECT here applies to every schema and table
+  # in the catalog, including ones that do not exist yet. That makes catalog-level
+  # SELECT a bigger decision than it looks.
+  catalog_grants = {
+    (databricks_group.engineers.display_name) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"]
+
+    # Analysts read, and only read. No MODIFY, no CREATE_TABLE.
+    (databricks_group.analysts.display_name) = ["USE_CATALOG", "USE_SCHEMA", "SELECT"]
+
+    # The pipeline identity. Keyed by APPLICATION ID - UC identifies service
+    # principals that way, not by display name the way it does groups.
+    (var.ci_application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
+  }
+
+  depends_on = [databricks_external_location.layers]
 }
 
 # --- Delegation: who may RUN AS the service principal ---------------------
 #
-# Holding workspace admin does NOT let you make a job run as some other
-# principal. If it did, anyone with admin could borrow the one identity that can
-# write to prod, and every boundary built on Days 4 and 5 would be decorative.
+# Holding workspace admin does NOT let you make a job run as another principal.
+# If it did, anyone with admin could borrow the one identity that writes to the
+# lake, and every boundary above would be decorative.
 #
 # Databricks models this as a role ON the service principal itself:
-#
-#   roles/servicePrincipal.user     - may run things AS it (bind it to run_as)
+#   roles/servicePrincipal.user     - may bind it to run_as
 #   roles/servicePrincipal.manager  - may change the principal and its delegation
 #
-# The rule set is AUTHORITATIVE for this one principal, exactly like
-# databricks_grants is for a catalog. Note the scope though - it names a single
-# servicePrincipals/<app id> path, so a mistake here cannot affect account
-# administration. The equivalent rule set at accounts/<id>/ruleSets/default IS
-# the account admin list, and that one deserves real caution.
+# AUTHORITATIVE for this one principal, exactly like databricks_grants is for a
+# catalog. Note the scope names a single servicePrincipals/<app id> path, so a
+# mistake here cannot affect account administration. The rule set at
+# accounts/<id>/ruleSets/default IS the account admin list, and deserves real
+# caution.
 resource "databricks_access_control_rule_set" "ci_delegation" {
   provider = databricks.account
   name     = "accounts/${var.databricks_account_id}/servicePrincipals/${var.ci_application_id}/ruleSets/default"
 
-  # You: full control, including handing this delegation to others.
   grant_rules {
     role       = "roles/servicePrincipal.manager"
     principals = [data.databricks_user.me.acl_principal_id]
   }
 
   # Engineers may DEPLOY jobs that run as the pipeline identity, but cannot
-  # modify the principal itself or widen its access. That split is the point:
-  # the ability to use an identity is separate from the ability to change it.
+  # modify the principal or widen its access. Using an identity and changing it
+  # are separate rights.
   grant_rules {
     role = "roles/servicePrincipal.user"
     principals = [
@@ -386,4 +277,3 @@ resource "databricks_access_control_rule_set" "ci_delegation" {
     ]
   }
 }
-

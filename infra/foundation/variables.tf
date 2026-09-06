@@ -41,7 +41,7 @@ variable "storage_account_name" {
 variable "containers" {
   description = "Filesystems to create in the lake. Medallion layers plus landing and checkpoints."
   type        = list(string)
-  default     = ["landing", "bronze", "silver", "gold", "checkpoints", "managed-dev", "managed-prod"]
+  default     = ["landing", "bronze", "silver", "gold", "checkpoints", "managed"]
 }
 
 variable "tags" {
@@ -80,4 +80,10 @@ variable "lake_data_admins" {
       type      = "ServicePrincipal"
     }
   }
+}
+
+variable "state_storage_account_name" {
+  description = "Where the network module keeps its state."
+  type        = string
+  default     = "sttfstatebhanu7391"
 }

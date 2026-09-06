@@ -1,15 +1,13 @@
 output "app_url" {
-  description = "Public HTTPS endpoint of the container app."
+  description = "Public HTTPS endpoint. Reachable only from allowed_source_ip."
   value       = "https://${azurerm_container_app.api.ingress[0].fqdn}"
 }
 
-output "acr_login_server" {
-  value = azurerm_container_registry.acr.login_server
-}
+output "acr_login_server" { value = azurerm_container_registry.acr.login_server }
 
 output "image_reference" {
   description = "What `az acr build` should produce."
-  value       = "${azurerm_container_registry.acr.login_server}/taxi-api:${var.image_tag}"
+  value       = "${azurerm_container_registry.acr.login_server}/${var.image_name}:${var.image_tag}"
 }
 
 output "app_client_id" {
@@ -17,6 +15,6 @@ output "app_client_id" {
   value       = azurerm_user_assigned_identity.app.client_id
 }
 
-output "serving_http_path" {
-  value = local.serving_http_path
-}
+output "serving_http_path" { value = local.serving_http_path }
+
+output "serving_compute" { value = var.serving_compute }

@@ -4,13 +4,25 @@ variable "state_storage_account_name" {
 }
 
 variable "ci_application_id" {
-  description = "Service principal the jobs RUN AS. Not a person."
+  description = "Service principal the job RUNS AS. Not a person."
   type        = string
   default     = "399c031a-6a58-4b51-9423-db05f87fa3bc"
 }
 
-variable "seed_batch" {
-  description = "Simulated upstream batch number. Override with -var seed_batch=2 to make new files land."
+variable "catalog" {
+  description = "Unity Catalog the pipeline writes into."
   type        = string
-  default     = "1"
+  default     = "fashion"
+}
+
+variable "start_date" {
+  description = "First day of generated history."
+  type        = string
+  default     = "2026-08-01"
+}
+
+variable "num_days" {
+  description = "Days of history. 28 gives four weekend cycles, which is what makes weekly seasonality visible in gold."
+  type        = string
+  default     = "28"
 }

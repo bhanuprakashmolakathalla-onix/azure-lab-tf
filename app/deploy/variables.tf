@@ -31,12 +31,17 @@ variable "azure_tenant_id" {
 variable "acr_name" {
   description = "Globally unique, alphanumeric only."
   type        = string
-  default     = "acrtaxibhanu7391"
+  default     = "acrfashionbhanu7391"
 
   validation {
     condition     = can(regex("^[a-zA-Z0-9]{5,50}$", var.acr_name))
     error_message = "ACR names are alphanumeric only - no hyphens, unlike almost every other Azure resource."
   }
+}
+
+variable "image_name" {
+  type    = string
+  default = "fashion-app"
 }
 
 variable "image_tag" {
@@ -45,20 +50,35 @@ variable "image_tag" {
   default     = "v1"
 }
 
+# The ONLY guard on the public ingress FQDN. A Container Apps ingress with no
+# restriction is reachable by the entire internet.
+variable "allowed_source_ip" {
+  description = "Public IP permitted to reach the app. Same value as the jumpbox NSG rule."
+  type        = string
+  default     = "106.222.203.222"
+}
+
 # THE COST LEVER for the serving tier.
 #
-#   "cluster"   single-node all-purpose. ~Rs 35-40/hr, ~6 MINUTE cold start.
-#               Right for a lab: start it, demo, kill it.
+#   "warehouse" 2X-Small SERVERLESS SQL. ~Rs 250/hr while running, ~10 SECOND
+#               cold start, scales to zero. What a real serving tier uses.
 #
-#   "warehouse" 2X-Small serverless SQL. ~Rs 250/hr, ~10 SECOND cold start.
-#               Right for anything a person waits on, and what a real serving
-#               tier uses. Warehouses are also built for concurrency; an
-#               all-purpose cluster is not.
+#               CAVEAT specific to this build: serverless compute runs in
+#               Databricks' network, NOT your VNet. The lake's firewall denies
+#               everything except the Access Connector resource instance, so
+#               whether serverless can read the lake depends on that exception
+#               covering it. If queries fail with a storage authorization error,
+#               that is the cause - and the fix is either an NCC with private
+#               endpoint rules, or switching this variable to "cluster".
+#
+#   "cluster"   single-node all-purpose, IN your VNet, reaching the lake over
+#               the private endpoints that are already proven to work.
+#               ~Rs 45/hr, ~6 MINUTE cold start.
 #
 # The application code is identical either way - only the HTTP path differs.
 variable "serving_compute" {
   type    = string
-  default = "cluster"
+  default = "warehouse"
 
   validation {
     condition     = contains(["cluster", "warehouse"], var.serving_compute)
@@ -66,15 +86,27 @@ variable "serving_compute" {
   }
 }
 
+# Pinned for the same reason the pipeline's is - see data/pipelines. Must clear
+# Azure capacity, Azure quota, AND the Databricks supported-node list.
+variable "node_type_id" {
+  type    = string
+  default = "Standard_D4ds_v5"
+}
+
 variable "catalog" {
   type    = string
-  default = "dev"
+  default = "fashion"
+}
+
+variable "brand_name" {
+  type    = string
+  default = "MERIDIAN"
 }
 
 variable "tags" {
   type = map(string)
   default = {
-    purpose    = "databricks-lab"
+    purpose    = "fashion-private"
     owner      = "bhanu"
     autodelete = "true"
   }

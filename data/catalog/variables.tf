@@ -3,14 +3,20 @@ variable "state_storage_account_name" {
   default = "sttfstatebhanu7391"
 }
 
+variable "catalog_name" {
+  description = "One catalog for the fashion platform. Environments are schemas' problem, not this lab's."
+  type        = string
+  default     = "fashion"
+}
+
 variable "schemas" {
-  description = "Medallion layers, created identically in every environment catalog."
+  description = "Medallion layers."
   type        = list(string)
   default     = ["bronze", "silver", "gold"]
 }
 
 variable "databricks_account_id" {
-  description = "Databricks account ID. Discovered with `databricks auth describe`, or from the account console user menu."
+  description = "Databricks account ID, from the account console user menu."
   type        = string
   default     = "2622394d-fa97-430e-a285-3ead22358fd1"
 }
