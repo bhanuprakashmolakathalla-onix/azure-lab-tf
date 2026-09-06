@@ -41,11 +41,26 @@ resource "databricks_storage_credential" "adls" {
   name    = "sc-lab01-adls"
   comment = "Managed identity for the lab lake. Managed by Terraform."
 
+  # Group, never a person. See the platform_admins comment above.
+  owner = databricks_group.platform_admins.display_name
+
   azure_managed_identity {
     access_connector_id = local.foundation.access_connector_id
   }
 
   force_destroy = true
+
+  # NOT redundant. Terraform's implicit dependencies follow REFERENCES, and
+  # `owner` above references the group's display_name - not its membership. So
+  # without this, Terraform may legally hand ownership to platform-admins BEFORE
+  # anyone is in it, and the apply loses its own permissions half way through.
+  #
+  # Everything else chains off this: external locations reference the credential,
+  # and the catalog modules depend on the external locations.
+  depends_on = [
+    databricks_group_member.platform_admin_me,
+    databricks_group_member.platform_admin_ci,
+  ]
 }
 
 resource "databricks_external_location" "layers" {
@@ -56,6 +71,7 @@ resource "databricks_external_location" "layers" {
   url             = each.value
   credential_name = databricks_storage_credential.adls.name
   comment         = "Lab lake: ${each.key}"
+  owner           = databricks_group.platform_admins.display_name
 
   force_destroy = true
 }
@@ -82,6 +98,7 @@ module "catalog_dev" {
   storage_root = local.foundation.container_urls["managed-dev"]
   workspace_id = local.workspaces.workspace_ids["dev"]
   schemas      = var.schemas
+  owner        = databricks_group.platform_admins.display_name
 
   # dev is where work happens: engineers can create and modify, analysts read.
   #
@@ -113,6 +130,7 @@ module "catalog_prod" {
   storage_root = local.foundation.container_urls["managed-prod"]
   workspace_id = local.workspaces.workspace_ids["prod"]
   schemas      = var.schemas
+  owner        = databricks_group.platform_admins.display_name
 
   # prod is read-only for humans. Nobody gets MODIFY or CREATE_TABLE - production
   # data arrives through jobs running as a service principal, never through a
@@ -155,6 +173,69 @@ resource "databricks_group" "engineers" {
 resource "databricks_group" "analysts" {
   provider     = databricks.account
   display_name = "data-analysts"
+}
+
+# --- Ownership group ------------------------------------------------------
+#
+# Every Unity Catalog object was previously owned by Bhanu personally, because
+# whoever creates an object owns it. That breaks in two ways:
+#
+#   1. CI cannot manage what it does not own. Account admin governs the ACCOUNT;
+#      it grants nothing inside the metastore. The service principal could see
+#      external location names (BROWSE) and read nothing about them - which is
+#      exactly the error this fixes.
+#   2. A person leaves and their objects become unmanageable. In a real org this
+#      is discovered at the worst possible moment.
+#
+# Owning platform objects with a GROUP fixes both. Membership changes without
+# touching ownership, and no single human is load-bearing.
+resource "databricks_group" "platform_admins" {
+  provider     = databricks.account
+  display_name = "platform-admins"
+}
+
+resource "databricks_group_member" "platform_admin_me" {
+  provider  = databricks.account
+  group_id  = databricks_group.platform_admins.id
+  member_id = data.databricks_user.me.id
+}
+
+resource "databricks_group_member" "platform_admin_ci" {
+  provider  = databricks.account
+  group_id  = databricks_group.platform_admins.id
+  member_id = databricks_service_principal.ci.id
+}
+
+# NOT OPTIONAL, and omitting it is how this group locked everyone out.
+#
+# An account-level group is invisible inside a workspace until it is ASSIGNED
+# there. Membership still exists at the account, but a workspace-scoped token
+# does not carry the group, so:
+#
+#   - ownership-by-group does not apply to you in that workspace
+#   - and if that group owns the objects, you cannot read your own metastore
+#
+# Which is exactly what happened: the owner transfer succeeded, and every
+# principal instantly lost access to the objects because nobody's workspace
+# identity included platform-admins.
+#
+# Same rule as Day 4 (identity -> assignment -> grants); this is the assignment
+# step again, one level up, applied to ownership instead of privileges.
+#
+# ADMIN rather than USER: this group owns the platform's UC objects and is the
+# identity CI operates as, so it needs to administer both workspaces.
+resource "databricks_mws_permission_assignment" "platform_admins_dev" {
+  provider     = databricks.account
+  workspace_id = local.workspaces.workspace_ids["dev"]
+  principal_id = databricks_group.platform_admins.id
+  permissions  = ["ADMIN"]
+}
+
+resource "databricks_mws_permission_assignment" "platform_admins_prod" {
+  provider     = databricks.account
+  workspace_id = local.workspaces.workspace_ids["prod"]
+  principal_id = databricks_group.platform_admins.id
+  permissions  = ["ADMIN"]
 }
 
 # Find yourself at account level so you can be put in a group.
@@ -290,4 +371,26 @@ resource "databricks_access_control_rule_set" "ci_delegation" {
       databricks_group.engineers.acl_principal_id,
     ]
   }
+}
+
+# --- Account admin --------------------------------------------------------
+#
+# Account admin is a SCIM ROLE on the principal, not an entry in a rule set.
+# Rule sets govern access TO a resource (this service principal, this group);
+# account_admin is an attribute OF an identity. Different model, different
+# resource - `roles/account_admin` in a rule set is rejected as unsupported.
+#
+# The distinction matters beyond the syntax error, because this resource is
+# ADDITIVE and per-principal. There is no authoritative list to accidentally
+# omit yourself from, so the lockout risk that applies to
+# databricks_access_control_rule_set simply does not exist here.
+#
+# Why CI needs it: without account admin the service principal cannot manage
+# groups, workspace assignments, or delegation - so this module could never run
+# in CI, leaving the one that governs who can access what as the only module
+# with no review gate.
+resource "databricks_service_principal_role" "ci_account_admin" {
+  provider             = databricks.account
+  service_principal_id = databricks_service_principal.ci.id
+  role                 = "account_admin"
 }

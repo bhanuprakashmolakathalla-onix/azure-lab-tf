@@ -16,6 +16,11 @@ permissions:
   contents: read
   # So the plan can be posted back onto the PR.
   pull-requests: write
+  # Lets the workflow publish its OWN check runs. An Actions job is already a
+  # check run, but its Checks-tab pane only links out to the run page - it does
+  # not render job summaries inline. A check run created through the Checks API
+  # carries `output.summary`/`output.text`, and THAT renders in the pane.
+  checks: write
 
 env:
   ARM_CLIENT_ID: ${{ vars.ARM_CLIENT_ID }}
@@ -53,7 +58,14 @@ jobs:
       max-parallel: 1
       fail-fast: true
       matrix:
-        module: [foundation, workspace, jobs]
+        # Dependency order, and it is load-bearing. unity-catalog reads the
+        # workspace module's outputs, and jobs reads them too - so unity-catalog
+        # must sit after workspace. It goes before jobs by convention rather than
+        # necessity: govern access first, then deploy things that use it.
+        #
+        # `compute` is deliberately absent. It starts a cluster, and a merge to
+        # main should not begin billing DBUs.
+        module: [foundation, workspace, unity-catalog, jobs]
 
     defaults:
       run:
@@ -104,24 +116,112 @@ jobs:
           if [ "$code" = "1" ]; then exit 1; fi
           terraform show -no-color tfplan > plan.txt
 
-      - name: Comment plan on PR
-        if: github.event_name == 'pull_request'
+      # Renders into the right-hand pane of the PR's "Checks" tab, and onto the
+      # job summary page. GITHUB_STEP_SUMMARY takes GitHub-flavoured markdown.
+      #
+      # Colour comes from a ```diff fence: GitHub's syntax highlighter paints
+      # lines starting with + green, - red, and ! orange. That is the only
+      # reliable way to get colour into a summary - inline HTML styling is
+      # stripped, and there is no colour syntax in GFM.
+      #
+      # `terraform show -json` is what makes this possible at all. Never scrape
+      # the human-readable plan text; it is explicitly not a stable interface,
+      # whereas the JSON has a versioned schema.
+      - name: Plan summary
+        if: always()
+        run: |
+          M="${{ matrix.module }}"
+          if [ ! -f tfplan ]; then
+            echo "### \`$M\` — plan did not complete" > summary.md
+            cat summary.md >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          terraform show -json tfplan > plan.json
+
+          # actions is an ARRAY: ["create"], ["update"], ["delete"], ["no-op"],
+          # and ["delete","create"] for a replacement. Length > 1 means replace.
+          q() { jq -r "$1" plan.json; }
+          add=$(q '[.resource_changes[]? | select(.change.actions == ["create"])] | length')
+          chg=$(q '[.resource_changes[]? | select(.change.actions == ["update"])] | length')
+          del=$(q '[.resource_changes[]? | select(.change.actions == ["delete"])] | length')
+          rep=$(q '[.resource_changes[]? | select((.change.actions | length) > 1)] | length')
+          total=$((add + chg + del + rep))
+
+          {
+            echo "## \`$M\`"
+            echo ""
+            if [ "$total" -eq 0 ]; then
+              echo "### ✅ No changes"
+              echo ""
+              echo "Real infrastructure matches the configuration."
+            else
+              echo "| 🟢 Add | 🟡 Change | ♻️ Replace | 🔴 Destroy |"
+              echo "|:---:|:---:|:---:|:---:|"
+              echo "| **$add** | **$chg** | **$rep** | **$del** |"
+              echo ""
+              echo "<details open><summary><b>Resources</b></summary>"
+              echo ""
+              echo '```diff'
+              q '.resource_changes[]? | select(.change.actions != ["no-op"]) |
+                 if   (.change.actions | length) > 1 then "! REPLACE  " + .address
+                 elif .change.actions == ["create"]  then "+ CREATE   " + .address
+                 elif .change.actions == ["update"]  then "~ UPDATE   " + .address
+                 elif .change.actions == ["delete"]  then "- DESTROY  " + .address
+                 else "  " + .address end'
+              echo '```'
+              echo ""
+              echo "</details>"
+            fi
+            echo ""
+            echo "<sub>Terraform $(terraform version -json | jq -r .terraform_version) · commit \`${GITHUB_SHA:0:7}\`</sub>"
+          } > summary.md
+
+          # Same content in two places: the job summary page, and (next step) a
+          # check run that renders inside the PR's Checks tab.
+          cat summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      # Publishes a check run whose body IS the plan, so selecting it in the
+      # Checks sidebar renders the table in place instead of bouncing you to the
+      # Actions run page.
+      #
+      # conclusion is always "neutral": this check REPORTS, it does not gate.
+      # The gating is the `terraform (<module>)` job itself, which fails on a
+      # broken plan. A reporting check that could turn a PR red would be a
+      # second, confusing source of truth about whether the PR is mergeable.
+      - name: Publish plan as a check run
+        if: always() && hashFiles(format('{0}/summary.md', matrix.module)) != ''
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const plan = fs.readFileSync('${{ matrix.module }}/plan.txt', 'utf8');
-            const changed = '${{ steps.plan.outputs.exitcode }}' === '2';
-            // GitHub comments cap at 65536 chars; a big plan must be truncated.
-            const body = changed
-              ? `### \`${{ matrix.module }}\` — changes planned\n\n<details><summary>Show plan</summary>\n\n\`\`\`terraform\n${plan.slice(0, 60000)}\n\`\`\`\n\n</details>`
-              : `### \`${{ matrix.module }}\` — no changes`;
-            await github.rest.issues.createComment({
-              issue_number: context.issue.number,
+            const body = fs.readFileSync('${{ matrix.module }}/summary.md', 'utf8');
+            // On a PR, context.sha is the merge commit; the head SHA is what the
+            // Checks tab is actually displaying, so the check must attach there.
+            const sha = context.payload.pull_request
+              ? context.payload.pull_request.head.sha
+              : context.sha;
+            await github.rest.checks.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body,
+              name: `plan: ${{ matrix.module }}`,
+              head_sha: sha,
+              status: 'completed',
+              conclusion: 'neutral',
+              output: {
+                title: `terraform plan — ${{ matrix.module }}`,
+                // summary renders above text; both accept GitHub-flavoured
+                // markdown, and text has a 64KB cap.
+                summary: body.slice(0, 60000),
+              },
             });
+
+      # NOTE: there is deliberately no "comment the plan on the PR" step.
+      #
+      # Four modules commenting on every push buries the conversation, and the
+      # same information now lives in the Checks tab where it belongs. Two copies
+      # of the same thing is worse than either alone - people stop trusting both
+      # once they disagree.
 
       # Apply ONLY from main, and only the plan file that was just reviewed.
       # Applying `tfplan` rather than re-planning means what runs is exactly what
