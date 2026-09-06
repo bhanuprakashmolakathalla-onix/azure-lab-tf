@@ -81,3 +81,33 @@ resource "azurerm_consumption_budget_subscription" "lab" {
     contact_emails = [var.alert_email]
   }
 }
+
+# --- CI identity, Databricks side ----------------------------------------
+#
+# MOVED HERE FROM unity-catalog after the Day 15 rebuild drill failed.
+#
+# The Entra service principal is created by bootstrap-ci-identity.ps1, outside
+# Terraform, because it cannot create itself. Its DATABRICKS registration was
+# originally in unity-catalog - a module built to be destroyed - and that was
+# wrong for two reasons the drill exposed:
+#
+#   1. `databricks_service_principal` destroy DEACTIVATES the account record
+#      rather than deleting it. Recreating then fails with "already exists",
+#      and everything downstream (account_admin, grants, run_as) fails behind it.
+#   2. More fundamentally: the identity that RUNS Terraform must not be owned by
+#      state that Terraform tears down. Same reasoning as the backend and budget.
+#
+# Adopted with `terraform import` rather than recreated, because the record
+# already exists - which is also the only way to flip `active` back to true.
+resource "databricks_service_principal" "ci" {
+  application_id = var.ci_application_id
+  display_name   = "sp-terraform-lab"
+  active         = true
+}
+
+# Account admin is a SCIM ROLE on the principal, not a rule-set entry. Additive
+# and per-principal, so there is no authoritative list to omit yourself from.
+resource "databricks_service_principal_role" "ci_account_admin" {
+  service_principal_id = databricks_service_principal.ci.id
+  role                 = "account_admin"
+}
