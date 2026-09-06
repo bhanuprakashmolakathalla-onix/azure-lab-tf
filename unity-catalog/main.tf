@@ -291,3 +291,25 @@ resource "databricks_access_control_rule_set" "ci_delegation" {
     ]
   }
 }
+
+# --- Account admin --------------------------------------------------------
+#
+# Account admin is a SCIM ROLE on the principal, not an entry in a rule set.
+# Rule sets govern access TO a resource (this service principal, this group);
+# account_admin is an attribute OF an identity. Different model, different
+# resource - `roles/account_admin` in a rule set is rejected as unsupported.
+#
+# The distinction matters beyond the syntax error, because this resource is
+# ADDITIVE and per-principal. There is no authoritative list to accidentally
+# omit yourself from, so the lockout risk that applies to
+# databricks_access_control_rule_set simply does not exist here.
+#
+# Why CI needs it: without account admin the service principal cannot manage
+# groups, workspace assignments, or delegation - so this module could never run
+# in CI, leaving the one that governs who can access what as the only module
+# with no review gate.
+resource "databricks_service_principal_role" "ci_account_admin" {
+  provider             = databricks.account
+  service_principal_id = databricks_service_principal.ci.id
+  role                 = "account_admin"
+}

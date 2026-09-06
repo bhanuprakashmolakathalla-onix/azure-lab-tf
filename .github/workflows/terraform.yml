@@ -53,7 +53,14 @@ jobs:
       max-parallel: 1
       fail-fast: true
       matrix:
-        module: [foundation, workspace, jobs]
+        # Dependency order, and it is load-bearing. unity-catalog reads the
+        # workspace module's outputs, and jobs reads them too - so unity-catalog
+        # must sit after workspace. It goes before jobs by convention rather than
+        # necessity: govern access first, then deploy things that use it.
+        #
+        # `compute` is deliberately absent. It starts a cluster, and a merge to
+        # main should not begin billing DBUs.
+        module: [foundation, workspace, unity-catalog, jobs]
 
     defaults:
       run:
