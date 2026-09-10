@@ -116,17 +116,40 @@ $ip = (Invoke-RestMethod https://api.ipify.org).Trim()
 terraform apply -var="allowed_source_ip=$ip" -var="admin_password=<a 12+ char password, 3 of: lower upper digit symbol>"
 ```
 
-Everything after this point talks to the Databricks workspace, whose hostname resolves
-only inside the transit or workspace VNet. **RDP to the jumpbox, clone the repo there, and
-continue:**
+Everything after this point talks to the Databricks workspace, whose hostname resolves only
+inside the transit or workspace VNet. Run it from the laptop and Terraform reaches the
+workspace and is refused: `Unauthorized network access to workspace`. That is the private
+endpoint working, not a permissions problem.
+
+**RDP in** with `mstsc /v:<public_ip>`, then in an **elevated** PowerShell:
 
 ```powershell
-cd data\catalog      ; terraform init ; terraform apply
-cd ..\pipelines      ; terraform init ; terraform apply
-# run the fashion-medallion job once, so gold has something in it
-cd ..\..\app         ; az acr build --registry <acr> --image fashion-app:v1 .
-cd deploy            ; terraform init ; terraform apply
+Set-ExecutionPolicy -Scope Process Bypass -Force
+iwr https://raw.githubusercontent.com/<owner>/azure-lab-tf/main/infra/bootstrap/jumpbox-setup.ps1 -OutFile setup.ps1
+.\setup.ps1
 ```
+
+The image is bare Windows Server: no Azure CLI, no Terraform, no repo. That script installs
+all three, signs you in, and then **resolves the workspace hostname** — which must come back
+as a `10.10.1.x` address. If it resolves to a public one, the private endpoint's DNS zone
+group is wrong and every apply below will hang and then time out with an error that says
+nothing about DNS. Check it before spending twenty minutes finding out the hard way.
+
+Then, still on the jumpbox:
+
+```powershell
+cd C:\lab\azure-lab-tf\data\catalog ; terraform init ; terraform apply
+cd ..\pipelines                     ; terraform init ; terraform apply
+# run the fashion-medallion job once from the Databricks UI, so gold has something in it
+cd ..\..\app                        ; az acr build --registry <acr> --image fashion-app:v1 .
+cd deploy                           ; terraform init
+terraform apply -var='allowed_source_ips=["<your laptop ip>"]'
+```
+
+`allowed_source_ips` is the only thing standing between two public FQDNs and the internet,
+and it has no default on purpose. Give it the address of whatever will **browse** the sites.
+That is your laptop, not the jumpbox — and if you want both, list both, because the transit
+VNet has no NAT gateway so the jumpbox presents its own public address.
 
 `terraform output shop_url` and `terraform output console_url` are the two links.
 
