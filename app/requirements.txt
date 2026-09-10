@@ -1,6 +1,19 @@
-# Minimum versions rather than exact pins: the Dockerfile builds a fresh image
-# each time, and a lock file belongs in the image build, not scattered here.
-fastapi>=0.115
-uvicorn[standard]>=0.32
-databricks-sql-connector>=3.4
-azure-identity>=1.19
+# PINNED, not floated.
+#
+# The repo commits .terraform.lock.hcl so that a CI run reproduces what ran
+# locally. A container built from minimum bounds throws that guarantee away one
+# layer up: the image that passes review and the image that ships are resolved
+# on different days from a moving index, and the difference only shows up in
+# production.
+#
+# Bump these deliberately, in a commit, with the plan visible - the same rule
+# the provider versions live under.
+fastapi==0.115.6
+uvicorn[standard]==0.34.0
+databricks-sql-connector==3.7.0
+azure-identity==1.19.0
+
+# Required by FastAPI to parse HTML form posts. Without it every form on the
+# storefront - add to bag, checkout, change status - returns a 500 that blames
+# the request rather than the missing package.
+python-multipart==0.0.20

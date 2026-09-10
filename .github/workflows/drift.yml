@@ -26,6 +26,7 @@ env:
   ARM_USE_OIDC: "true"
   DATABRICKS_AUTH_TYPE: azure-cli
   TF_IN_AUTOMATION: "true"
+  STATE_ACCOUNT: sttfstatebhanu7391
 
 jobs:
   detect:
@@ -41,7 +42,24 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        module: [foundation, workspace, unity-catalog, jobs, governance]
+        # data/*, app/deploy and infra/compute excluded: the databricks provider
+        # cannot reach a workspace with no public endpoint from a GitHub-hosted
+        # runner. infra/jumpbox needs a password. See terraform.yml for both.
+        #
+        # `requires` names the upstream state keys, same as the deploy workflow.
+        # A destroyed lab has nothing to drift FROM, and a nightly job that goes
+        # red every night because the lab is correctly torn down is worse than no
+        # nightly job - it trains everyone to ignore the one morning it means
+        # something.
+        include:
+          - module: infra/network
+            requires: ""
+          - module: infra/foundation
+            requires: "network.tfstate"
+          - module: infra/workspace
+            requires: "network.tfstate foundation.tfstate"
+          - module: infra/governance
+            requires: ""
 
     defaults:
       run:
@@ -65,6 +83,38 @@ jobs:
       - name: Init
         run: terraform init -input=false
 
+      # Is this module deployed at all? An empty state - `"outputs": {}` - is
+      # what a torn-down module looks like, and it is not drift. See the longer
+      # note in terraform.yml.
+      - name: Upstream state
+        id: upstream
+        run: |
+          ready=true
+          # Quoted into a variable first. An empty word list after `in` is legal in
+          # bash 5 and a parse error in stricter shells; an empty VARIABLE simply
+          # expands to zero words everywhere.
+          requires="${{ matrix.requires }}"
+          for key in $requires; do
+            outputs=0
+            if az storage blob download \
+                 --account-name "${STATE_ACCOUNT}" \
+                 --container-name tfstate \
+                 --name "$key" \
+                 --auth-mode login \
+                 --file "/tmp/$key" \
+                 --no-progress --output none 2>/dev/null; then
+              outputs=$(jq -r '.outputs | length' "/tmp/$key" 2>/dev/null || echo 0)
+            fi
+            if [ "${outputs:-0}" -eq 0 ]; then
+              echo "not applied: $key has no outputs"
+              ready=false
+            fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+          if [ "$ready" != "true" ]; then
+            echo "### \`${{ matrix.module }}\` — not deployed, nothing to check" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # -detailed-exitcode is the whole mechanism:
       #   0 = no changes      1 = error      2 = drift
       #
@@ -73,6 +123,7 @@ jobs:
       # means every alert needs a human to classify it before anyone can act.
       - name: Plan
         id: plan
+        if: steps.upstream.outputs.ready == 'true'
         run: |
           set +e
           terraform plan -input=false -no-color -detailed-exitcode -out=tfplan

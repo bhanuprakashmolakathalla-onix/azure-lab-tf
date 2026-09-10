@@ -1,37 +1,58 @@
 # azure-lab-tf
 
-An Azure Databricks lakehouse platform, built as infrastructure-as-code from an empty
-subscription. Six Terraform root modules, two environments, a medallion pipeline, and a
-CI/CD pipeline that deploys all of it with **no stored credentials**.
+A private Azure Databricks lakehouse, built as infrastructure-as-code from an empty
+subscription, with two websites on top of it: a **storefront** people buy from and an
+**operations console** somebody runs the business from.
 
-Running cost when idle: **~₹10/month**. Total cost to build: **~₹40**.
+Nine Terraform root modules, a medallion pipeline over generated fashion-retail data,
+and CI that deploys the Azure half with **no stored credentials**.
+
+The point of the pair is that they meet in the lakehouse. The shop writes an order to
+`fashion.ops.orders`; the console reads it seconds later, works it through picking and
+shipping, and shows the trading figures the same warehouse produced. Nothing is mocked
+between them.
 
 ---
 
-## What it provisions
+## What it builds
 
 ```
 Azure subscription
 ├── rg-terraform-state/              state backend (bootstrapped imperatively, once)
 │   └── sttfstatebhanu7391           versioned, shared keys DISABLED, Entra auth only
 │
-└── rg-lab01-foundation/
-    ├── stdatalakebhanu7391          ADLS Gen2, hierarchical namespace
-    │   ├── landing/                 Auto Loader source
-    │   ├── bronze/ silver/ gold/    medallion layers (external locations)
-    │   ├── managed-dev/             dev catalog's managed storage
-    │   ├── managed-prod/            prod catalog's managed storage
-    │   └── checkpoints/             Auto Loader schema + commit state
-    │
-    ├── dbac-lab01-uc                Access Connector (managed identity for UC)
-    ├── dbw-lab01-dev                Databricks workspace
-    └── dbw-lab01-prod               Databricks workspace
+├── rg-lab01-transit/                humans and the apps
+│   ├── vnet-transit 10.10.0.0/16
+│   │   ├── snet-privatelink         front-end + browser-auth private endpoints
+│   │   ├── snet-jumpbox             the only way in
+│   │   └── snet-apps /23            Container Apps, VNet-injected
+│   ├── vm-jumpbox                   RDP from one address only
+│   └── privatelink.azuredatabricks.net   FRONT-END zone
+│
+├── rg-lab01-network/                clusters
+│   ├── vnet-databricks 10.20.0.0/16
+│   │   ├── snet-host / snet-container    delegated, no public IPs
+│   │   └── snet-privatelink              back-end + storage endpoints
+│   ├── nat-databricks               single egress address
+│   └── privatelink.azuredatabricks.net   BACK-END zone (same name, different RG)
+│
+├── rg-lab01-foundation/
+│   ├── stdatalakebhanu7391          ADLS Gen2, HNS, firewall deny-by-default
+│   │   └── landing/ bronze/ silver/ gold/ checkpoints/ managed/
+│   ├── dbac-lab01-uc                Access Connector (managed identity for UC)
+│   └── dbw-fashion                  Databricks workspace, no public path in or out
+│
+└── rg-lab01-serving/
+    ├── acrfashionbhanu7391          Basic by default, admin access disabled
+    ├── id-fashion-shop              storefront identity
+    ├── id-fashion-console           console identity
+    ├── ca-fashion-shop              the shop
+    └── ca-fashion-console           the ops console
 
 Unity Catalog (account-level, region-wide, survives every teardown)
 ├── sc-lab01-adls                    storage credential -> Access Connector
-├── el-lab01-*                       7 external locations
-├── dev  (ISOLATED)                  bronze / silver / gold
-└── prod (ISOLATED)                  bronze / silver / gold
+├── el-lab01-*                       6 external locations
+└── fashion (ISOLATED)               bronze / silver / gold / ops
 ```
 
 ## Module layout
@@ -39,55 +60,168 @@ Unity Catalog (account-level, region-wide, survives every teardown)
 Each directory is a **root module with its own state file**. They read each other through
 `terraform_remote_state`, never through a shared state file.
 
-| Module | State key | Owns |
-|---|---|---|
-| `foundation` | `foundation.tfstate` | resource group, ADLS Gen2, containers, Access Connector, data-plane RBAC |
-| `workspace` | `workspace.tfstate` | both Databricks workspaces (`for_each`) |
-| `unity-catalog` | `unity-catalog.tfstate` | storage credential, external locations, catalogs, schemas, groups, grants, bindings |
-| `jobs` | `jobs.tfstate` | notebooks and the medallion job, per environment |
-| `compute` | `compute.tfstate` | cluster policy + an all-purpose cluster for ad-hoc work |
-| `governance` | `governance.tfstate` | subscription budget and alerts; the CI principal's Databricks identity |
+| Module | State key | Owns | Runs from |
+|---|---|---|---|
+| `infra/network` | `network.tfstate` | VNets, subnets, NSG, NAT gateway, private DNS, peering | anywhere |
+| `infra/foundation` | `foundation.tfstate` | resource group, ADLS Gen2, containers, storage endpoints, Access Connector, data-plane RBAC | anywhere |
+| `infra/workspace` | `workspace.tfstate` | the Databricks workspace and its three private endpoints | anywhere |
+| `infra/governance` | `governance.tfstate` | subscription budget and alerts; the CI principal's Databricks identity | anywhere |
+| `infra/jumpbox` | `jumpbox.tfstate` | the VM that is the only way into the private network | anywhere |
+| `infra/compute` | `compute.tfstate` | cluster policy + an ad-hoc cluster. Optional, and bills while it runs | **jumpbox** |
+| `data/catalog` | `unity-catalog.tfstate` | storage credential, external locations, catalog, schemas, groups, grants, bindings | **jumpbox** |
+| `data/pipelines` | `jobs.tfstate` | notebooks and the medallion job | **jumpbox** |
+| `app/deploy` | `serving.tfstate` | registry, both container apps, both identities, SQL warehouse, app grants | **jumpbox** |
 
-**Why separate state files rather than one?** Blast radius. A `terraform destroy` in `compute`
-physically cannot reach the lake, because the lake is not in that state file. The cost is
-losing a single `apply`; the benefit is that a bad day stays contained.
+**The state keys do not all match their directory names.** `data/catalog` writes
+`unity-catalog.tfstate`, `data/pipelines` writes `jobs.tfstate`, and `app/deploy` writes
+`serving.tfstate`. Those are the names from before the restructure and they were kept
+deliberately: renaming a state key does not move the state, it orphans it.
 
-`governance` is separate for a different reason: it holds what must **outlive** a teardown of
-the lab. A budget that vanishes with the resources it was watching is worse than no budget —
-and the service principal that *runs* Terraform must not be owned by state that Terraform
-destroys.
+**Why separate state files rather than one?** Blast radius. A `terraform destroy` in
+`compute` physically cannot reach the lake, because the lake is not in that state file.
+The cost is losing a single `apply`; the benefit is that a bad day stays contained.
+
+`governance` is separate for a different reason: it holds what must **outlive** a teardown.
+A budget that vanishes with the resources it was watching is worse than no budget, and the
+service principal that *runs* Terraform must not be owned by state that Terraform destroys.
 
 ## Getting it running
 
-Two bootstraps come first, both imperative, both for the same reason — Terraform cannot
-create the thing it depends on to run.
+Three bootstraps first, all imperative, all for the same reason — Terraform cannot create
+the thing it depends on to run.
 
 ```powershell
-.\bootstrap-backend.ps1          # state storage. Terraform needs somewhere to keep state.
-.\bootstrap-ci-identity.ps1      # the SP that runs Terraform. It cannot create itself.
-.\bootstrap-github-oidc.ps1 -GitHubOwner <you> -GitHubRepo azure-lab-tf -OwnerId <id> -RepoId <id>
+.\infra\bootstrap\bootstrap-backend.ps1       # state storage
+.\infra\bootstrap\bootstrap-ci-identity.ps1   # the SP that runs Terraform
+.\infra\bootstrap\bootstrap-github-oidc.ps1 -GitHubOwner <you> -GitHubRepo azure-lab-tf -OwnerId <id> -RepoId <id>
 ```
 
-Then, in dependency order:
+> `bootstrap-ci-identity.ps1` mints a **one-year client secret** so you can run Terraform as
+> the service principal before federation exists. The OIDC script prints the `az` command to
+> delete it and does not run it for you. Until you do, the repo's secretless claim is one
+> manual step short of true.
+
+Then, in dependency order. The first four reach ARM over the public internet and run anywhere:
 
 ```powershell
-cd foundation     ; terraform init ; terraform apply
-cd ../workspace   ; terraform init ; terraform apply
-cd ../unity-catalog ; terraform init ; terraform apply
-cd ../jobs        ; terraform init ; terraform apply
-cd ../governance  ; terraform init ; terraform apply
+cd infra\network     ; terraform init ; terraform apply
+cd ..\foundation     ; terraform init ; terraform apply
+cd ..\workspace      ; terraform init ; terraform apply
+cd ..\governance     ; terraform init ; terraform apply
+cd ..\jumpbox        ; terraform init ; terraform apply -var="allowed_source_ip=<your ip>" -var="admin_password=<password>"
 ```
 
-`compute` is optional and costs money while it runs.
+Everything after this point talks to the Databricks workspace, whose hostname resolves
+only inside the transit or workspace VNet. **RDP to the jumpbox, clone the repo there, and
+continue:**
 
-**Measured by actually doing it**, not estimated:
+```powershell
+cd data\catalog      ; terraform init ; terraform apply
+cd ..\pipelines      ; terraform init ; terraform apply
+# run the fashion-medallion job once, so gold has something in it
+cd ..\..\app         ; az acr build --registry <acr> --image fashion-app:v1 .
+cd deploy            ; terraform init ; terraform apply
+```
+
+`terraform output shop_url` and `terraform output console_url` are the two links.
+
+### Tearing it down
+
+```powershell
+.\infra\bootstrap\teardown.ps1 -Scope All        # correct, ~12 minutes
+.\infra\bootstrap\teardown.ps1 -Scope All -Fast  # ~4 minutes, empties state
+```
+
+Order is not negotiable and is why this is a script. The Databricks modules go first,
+because they own account-level objects that live in **no resource group** — groups, service
+principals, the storage credential and its external locations. Delete the resource groups
+first and those are orphaned, invisible, and waiting to collide with the next rebuild. The
+jumpbox goes after them, because destroying your way in locks you out of the rest.
+
+**Measured by actually doing it**, on the previous build:
 
 | | |
 |---|---|
 | Teardown — 4 modules, 64 resources | **12m41s** |
 | Rebuild from empty — 4 modules, ~70 resources | **~15 min** |
 
-The two workspaces dominate both directions, roughly 4 minutes each, in parallel.
+## A session, end to end
+
+The lab is designed to be built, used, and destroyed the same day. The whole loop:
+
+1. **Build the Azure half** from the laptop — network, foundation, workspace, governance,
+   jumpbox. Roughly 15 minutes, most of it the workspace and its private endpoints.
+2. **RDP to the jumpbox** and build the Databricks half — catalog, pipelines, then the image
+   and the two sites.
+3. **Run `fashion-medallion` once.** Nothing has a catalogue until gold exists. The seed task
+   pays a one-off cluster cold start of about six minutes; the other three tasks are seconds.
+4. **Open both links.** Browse, add to bag, check out. The order appears in the console's
+   order book within a few seconds. Advance it through packed and shipped, or cancel it and
+   watch the stock come back on the product page.
+5. **Tear down in two halves, from two machines.** The Databricks stage runs on the jumpbox
+   because it is the only thing that can reach the workspace. The Azure stage must not,
+   because it deletes the jumpbox out from under itself:
+
+   ```powershell
+   # on the jumpbox
+   .\infra\bootstrap\teardown.ps1 -Scope Databricks
+   # back on the laptop
+   .\infra\bootstrap\teardown.ps1 -Scope Azure -Fast
+   ```
+
+The single most expensive mistake available here is stopping after step 4.
+
+## The two sites
+
+One container image, two container apps, selected by `APP_ROLE`. The code is shared
+because it is the same code; the **identities are not**, because the privileges are not.
+
+| | `gold` | `silver` | `ops` |
+|---|---|---|---|
+| `id-fashion-shop` | read | — | read, write, create |
+| `id-fashion-console` | read | read | read, write |
+
+The shop can take an order and cannot look at the silver layer. The console can see
+everything the pipeline produced, including what it quarantined, and cannot create a
+table. Neither holds a secret.
+
+**The storefront** browses a catalogue, filters by colour and size, shows markdown against
+list price, greys out sold-out sizes, and takes an order. No payment is collected. Product
+imagery is drawn as vector garments tinted with each product's real colour — a remote image
+CDN would be a hole in the network posture for the sake of decoration, and no photograph of
+a generated product exists anyway.
+
+The fit note on every product page is the most interesting thing on it: it reads
+`gold.returns_analysis`, a mart built for merchandisers, and turns it into a sentence a
+shopper can act on. Every retailer knows why its returns happen and almost none of them
+tell you before you buy.
+
+**The console** works the order book, advances fulfilment status with `UPDATE` statements
+against Delta, and shows trading, inventory health and the silver quarantine counts.
+
+### Why browsing never queries the warehouse
+
+The catalogue is a few hundred rows that change only when the pipeline runs, so it is
+loaded **once** and held in the process. Browsing, filtering, sorting and product pages
+touch nothing. The warehouse is woken only by checkout and by the console.
+
+The cache is stale-tolerant rather than merely time-limited: when an entry expires the page
+still renders from the old value and a background thread fetches the new one. A shopper
+never waits on a refresh. A serverless warehouse bills while it is *running*, so a shop that
+queried on every page view would keep it running all day and still feel slow.
+
+### What the shop deliberately does not do
+
+Stock shown is the last pipeline snapshot minus orders placed since. **It is not a
+reservation system.** Two shoppers can buy the last unit at the same time and both succeed.
+A real storefront holds stock in a transactional store at add-to-bag time; a lakehouse
+snapshot cannot do that and should not pretend to.
+
+The same honesty applies to the order book itself. Delta is a poor transactional store —
+every insert is a new commit and a new file. A real business writes orders to Postgres or
+Cosmos DB and lands them here by change data capture. At a handful of orders in a sitting
+the direct write is fine, and it is what makes the write-path identity gates visible end to
+end.
 
 ## CI/CD
 
@@ -95,13 +229,21 @@ The two workspaces dominate both directions, roughly 4 minutes each, in parallel
 Applies the reviewed plan file, never a fresh plan, so what runs is exactly what was
 approved.
 
-`.github/workflows/drift.yml` — nightly `plan` across every module. Opens one GitHub issue
-per drifted module, reuses it rather than creating duplicates, and closes it when the module
-comes back clean.
+`.github/workflows/drift.yml` — nightly `plan` across every module CI can reach. Opens one
+GitHub issue per drifted module, reuses it rather than creating duplicates, and closes it
+when the module comes back clean.
 
-**Authentication is entirely secretless.** GitHub mints a short-lived OIDC token, Entra is
-configured to trust that specific repository and ref, and the service principal has no
-password at all. Nothing long-lived exists to leak.
+**CI covers the four `azurerm` modules only.** `data/*`, `app/deploy` and `infra/compute`
+use the `databricks` provider, whose host is the workspace URL — and since
+`public_network_access_enabled = false`, that name resolves only inside the VNet. A
+GitHub-hosted runner is on Microsoft public infrastructure, outside both. Those modules
+cannot run there: not slowly, not with a token, not at all. The real fix is a self-hosted
+runner inside the VNet, which is exactly why regulated organisations run their own runner
+fleets.
+
+**Authentication is secretless.** GitHub mints a short-lived OIDC token, Entra is configured
+to trust that specific repository and ref, and the federated credential uses the immutable
+`repo:OWNER@ID/REPO@ID:` subject format that cannot be claimed by a recycled repository name.
 
 ## The security model
 
@@ -116,30 +258,52 @@ Four independent gates, each enforced by a different subsystem, each failing dif
 
 Concretely:
 
-- `dev` and `prod` catalogs are `ISOLATED` and bound to their own workspace. `prod` is
-  additionally bound `READ_ONLY` to the dev workspace — dev can read production, and writes
-  from there are structurally impossible, not merely un-granted.
-- The asymmetry is deliberate: `prod` grants dev nothing back, so production cannot come to
-  depend on dev data by accident.
-- **No human can write to `prod`.** The only principal with `MODIFY` is the service
-  principal, and the jobs run as it. Production changes arrive through a reviewed pipeline.
+- The `fashion` catalog is `ISOLATED` and bound to one workspace. A metastore is
+  **region-wide**, so any workspace attached later would otherwise see every `OPEN` catalog
+  by default. The failure this prevents is somebody else's future workspace, not yours.
 - Unity Catalog objects are owned by the **`platform-admins` group**, never by a person.
+  Whoever creates a UC object owns it, and a person leaving makes their objects unmanageable.
+- Analysts hold `USE_CATALOG` at the catalog and `SELECT` only on `gold`. A catalog-level
+  `SELECT` would cascade to every schema added from now on, including `ops`.
+- Jobs run as the **service principal**, not as a person, and binding a principal to
+  `run_as` is a separate right from workspace admin.
+
+### One thing that was wrong here, and is worth the paragraph
+
+`databricks_grants` (plural) is **authoritative**: it declares the complete privilege set
+for a securable and revokes anything absent. `data/catalog` used it on the `fashion`
+catalog while `app/deploy` granted the app identities on the same catalog with
+`databricks_grant` (singular). Every apply of the catalog module silently revoked the apps'
+access, and the sites started reporting that `gold` did not exist — both modules reporting
+success, neither converging.
+
+Two modules granting on one securable means the **singular** form in both. The cost is
+real and stated in the code: nothing declares the complete set any more, so a privilege
+granted by hand in the UI will survive. That is the trade for shared ownership, and drift
+detection is what covers it.
 
 ## The pipeline
 
-`samples.nyctaxi` → `landing/` → **bronze** → **silver** → **gold**, running as the service
+Generated drops → `landing/` → **bronze** → **silver** → **gold**, running as the service
 principal on a single shared job cluster.
 
+- **seed** — fakes the upstream systems a fashion retailer has: POS, warehouse and returns
+  dropping dated JSON files, plus a full product and store snapshot. Deterministic, so a
+  pipeline bug is distinguishable from a data change. The data has three properties generic
+  retail examples miss: a **size curve**, **markdown decay**, and **category-dependent
+  return rates**.
 - **bronze** — Auto Loader (`cloudFiles`) with `trigger(availableNow=True)`. Incremental:
-  cost is proportional to what arrived, not to total history. Schema and commit checkpoints
-  live in separate directories because they have different blast radii.
+  cost is proportional to what arrived, not to total history. Anything that does not fit the
+  schema lands in `_rescued_data` rather than being dropped.
 - **silver** — business rules are **named**, and failing rows go to a quarantine table with
-  the list of rules they broke, rather than being silently dropped.
-- **gold** — daily aggregates, shaped for a consumer.
+  the list of rules they broke. A non-null `_rescued_data` is one of those rules, in every
+  stream. Returns are netted off sales here, once, so no downstream table has to remember.
+- **gold** — seven marts. Five answer a merchandising question; two serve the storefront at
+  the grain a shopper thinks in, sized to fit in the app's memory.
 
-## Cost engineering
+## Cost
 
-Measured, not assumed — `analysis/cost_attribution.sql` has the queries.
+Measured DBU rates, from `data/analysis/cost_attribution.sql`:
 
 | SKU | $/DBU |
 |---|---|
@@ -148,62 +312,92 @@ Measured, not assumed — `analysis/cost_attribution.sql` has the queries.
 | `PREMIUM_JOBS_COMPUTE` | **0.300** |
 
 All-purpose compute costs **1.83× job compute for identical hardware**. One interactive
-cluster used for a few queries cost more than every pipeline run of the fortnight combined.
+cluster used for a few queries cost more than every pipeline run of a fortnight combined.
+
+What actually runs up a bill on this build, and what each lever does:
+
+| Resource | Rate | Lever |
+|---|---|---|
+| NAT gateway | ~₹100/day | required for cluster egress; Azure Firewall would be 10× |
+| Jumpbox `E4bs_v5` | ~₹33/hour running | `az vm deallocate`; auto-shutdown at 23:00 IST |
+| Container registry | Basic ~₹15/day | `acr_sku`. Premium is ~10× and buys only a private endpoint |
+| Serverless SQL warehouse | ~₹250/hour running | `warehouse_auto_stop_mins`, and the in-process catalogue cache |
+| Job cluster, single node | ~₹45/hour | runs only while the job runs |
+| Container Apps | ~0 idle | `min_replicas = 0` |
+| State storage | ~₹5/month | left standing on purpose |
+
+A build, a session of clicking around, and a teardown in the same day lands in the low
+hundreds of rupees. The two settings that dominate it are the jumpbox being deallocated
+when you are not on it, and the whole thing being torn down when you are done.
 
 Decisions that mattered more than the numbers:
 
-- **`no_public_ip = false`** on the workspaces. Secure cluster connectivity provisions a NAT
-  gateway billing ~₹100/day whether or not anything runs. Turning it off took idle cost from
-  ~₹3,000/month to ~₹10/month. Wrong for production, right for a lab torn down nightly.
+- **The catalogue cache.** It is a cost control, not a performance trick. Browsing that
+  queried the warehouse would keep a serverless SKU awake continuously.
 - **One job cluster shared across all tasks.** Measured: 351s of cold start paid once, then
-  1s per subsequent task. Per-task clusters would have paid it three times for 63s of work.
-- **Ask for a node *shape*, not a SKU.** `data "databricks_node_type"` with `min_cores` lets
-  Databricks route around regional capacity stockouts. Quota is not capacity.
+  1s per subsequent task. Per-task clusters would have paid it four times for a minute of work.
+- **Ask for a node *shape*, not a SKU** — except when you cannot. `data "databricks_node_type"`
+  routes around regional stockouts, but it has no visibility into your quota and will happily
+  return a SKU you are not permitted to allocate. Both pipeline and compute now pin the type.
 
 ## Things that cost time, documented so they cost yours less
 
 - **Owner grants no data access.** Azure splits `actions` (control plane) from `dataActions`
   (data plane), and the built-in Owner role has `dataActions: []`. `roles/owner` in GCP does
   cover object access; this is the sharpest false friend in the mapping.
+- **Two ways to close a storage account, and only one leaves Unity Catalog working.**
+  `public_network_access_enabled = false` kills the endpoint outright and breaks credential
+  validation, which runs from the Databricks **control plane** outside your VNet.
+  `network_rules` with `default_action = Deny` plus a `private_link_access` exception for
+  the Access Connector is what production actually runs.
+- **A private endpoint with no `private_dns_zone_group` resolves to nothing.** The endpoint
+  exists, holds an IP, and every client still gets the public address.
+- **Two same-named private DNS zones, in two resource groups.** Front-end and back-end
+  endpoints target the same sub-resource and therefore the same hostname, but a user and a
+  cluster must resolve it to different addresses. Zone names are unique per resource group,
+  so the split is what makes the architecture expressible at all.
+- **The browser-authentication endpoint is the one everybody forgets.** Sign-in redirects to
+  Entra, which calls back to the Databricks web app; with no public path the callback cannot
+  land and login spins forever, looking like a broken workspace.
+- **Attaching a private endpoint updates the workspace**, and the API rejects concurrent
+  updates with `ConcurrentUpdateError`. Terraform parallelises to 10 and nothing in the
+  config says these three conflict. A `depends_on` chain is the fix.
 - **HNS and blob versioning are mutually exclusive.** Delta's transaction log is the
-  replacement, and it is the better tool anyway — versioning per table, not per blob.
+  replacement, and it versions per table rather than per blob.
 - **Azure propagates workspace resource tags onto clusters as *default* tags.** Setting the
   same tag in a cluster policy collides with the inherited one and cluster creation fails.
-  The upside: cost attribution by tag works with no cluster-level tagging at all.
 - **The `databricks` provider cannot live in the module that creates its own workspace** —
   its `host` is the workspace URL, and provider blocks evaluate before any resource exists.
-  The module split is what makes the reference legal.
 - **A variable may change what a resource looks like, never which provider manages it.**
-  State records which workspace each object belongs to; repointing a provider under populated
-  state is incoherent, and the provider correctly refuses.
 - **An account-level group is invisible inside a workspace until it is *assigned* there.**
   Transferring object ownership to an unassigned group succeeds and then locks out every
   principal at once.
-- **`databricks_grants` is authoritative.** It declares the complete privilege set and
-  silently revokes anything granted outside Terraform.
 - **`databricks_job` task blocks are a positional list**, and the API returns them sorted
   alphabetically. Config must match that order or every plan shows a diff that applies
   successfully and immediately returns.
 - **`databricks_service_principal` does not round-trip.** Its SCIM delete DEACTIVATES the
   account record instead of removing it, so destroy-then-recreate collides with "already
-  exists" and leaves `run_as` pointing at an inactive principal. The fix is structural rather
-  than a workaround: an identity that *runs* Terraform belongs outside the state Terraform
-  destroys. Only a full rebuild drill surfaces this class of bug — every other operation had
-  worked for two weeks.
+  exists". The fix is structural: an identity that *runs* Terraform belongs outside the
+  state Terraform destroys.
+- **`CAN_ATTACH_TO` fails when both ends are elastic.** The app scales to zero and the
+  cluster auto-terminates, so by the time a request arrives there is nothing running to
+  attach to — the caller needs `CAN_RESTART` to start it.
+- **Null is not a small case.** `days_of_cover` is null when nothing sold, every comparison
+  against null is null, and dead stock fell through to `otherwise("healthy")`. The single
+  worst state in the inventory was reported as the best one.
 - **`az` on Windows is a `.cmd` shim**, so `( ) < > | & ^` are live cmd metacharacters even
   inside PowerShell quotes. Keep JMESPath function calls out of `--query`.
 
 ## Repository
 
 ```
-bootstrap-*.ps1              one-time, imperative, deliberately outside Terraform
-foundation/ workspace/ unity-catalog/ jobs/ compute/ governance/
-jobs/modules/pipeline/       reusable pipeline, instantiated per environment
-unity-catalog/modules/catalog/  reusable catalog, instantiated per environment
-analysis/cost_attribution.sql
+infra/bootstrap/         one-time, imperative, deliberately outside Terraform
+                         plus teardown.ps1, which is the most important script here
+infra/                   network, foundation, workspace, governance, jumpbox, compute
+data/catalog/            Unity Catalog: credential, locations, catalog, grants
+data/pipelines/          the medallion job and its four notebooks
+data/analysis/           cost attribution and Delta operations, as SQL you paste into a cell
+app/src/                 both sites: db, cart, imagery, theme, charts, shop, console
+app/deploy/              registry, two container apps, two identities, SQL warehouse
 .github/workflows/
 ```
-
-Both child modules are instantiated **twice** with different provider aliases, because
-Terraform cannot select a provider from a `for_each` key. That constraint is useful: it forces
-the provider choice to be explicit and reviewable in the diff.

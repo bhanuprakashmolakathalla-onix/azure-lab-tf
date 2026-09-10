@@ -1,5 +1,6 @@
-# Multi-stage so the runtime image carries no build toolchain.
+# One image, two applications. APP_ROLE picks which one at start-up.
 #
+# Multi-stage so the runtime image carries no build toolchain.
 # databricks-sql-connector pulls pyarrow and thrift, which need a compiler on
 # some platforms. Building in one stage and copying the installed packages into
 # a clean image keeps the result small and removes gcc from anything that faces
@@ -30,12 +31,18 @@ ENV PATH="/opt/venv/bin:$PATH" \
     PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1
 
-# Container Apps injects the port it wants; defaulting keeps `docker run` working
-# locally without extra flags.
-ENV PORT=8000
+# The port the app listens on. Container Apps routes to whatever `target_port`
+# says, so the two have to agree - they are both 8000, set in one place each and
+# never inferred.
+ENV PORT=8000 \
+    APP_ROLE=shop
 EXPOSE 8000
 
 # Single worker deliberately. Container Apps scales by adding REPLICAS, not by
 # adding processes inside one container - so a second worker just doubles idle
 # memory and confuses the autoscaler's per-replica concurrency signal.
+#
+# It also keeps the in-process catalogue cache meaningful: one worker means one
+# copy, warmed once. Four workers would mean four cold caches behind one
+# hostname and four wake-ups of the same warehouse.
 CMD ["sh", "-c", "uvicorn src.main:app --host 0.0.0.0 --port ${PORT} --workers 1"]
