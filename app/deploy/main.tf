@@ -292,17 +292,21 @@ resource "azurerm_container_app" "site" {
 
     # THE PUBLIC SURFACE, AND ITS ONLY GUARD.
     #
-    # The FQDN is world-resolvable; this is what stops the world using it. One
-    # allow rule means everything else is denied - Container Apps switches to
-    # deny-by-default the moment a single Allow rule exists, so there is no
-    # companion deny rule to write, and writing one would be a mistake.
+    # The FQDN is world-resolvable; this is what stops the world using it.
+    # Container Apps switches to deny-by-default the moment a single Allow rule
+    # exists, so there is no companion deny rule to write - and writing one would
+    # be a mistake, because a Deny alongside an Allow changes the evaluation from
+    # "allowlist" to something nobody can reason about at 2am.
     #
     # The console needs this more than the shop does: it can cancel orders.
-    ip_security_restriction {
-      name             = "allow-operator"
-      action           = "Allow"
-      ip_address_range = "${var.allowed_source_ip}/32"
-      description      = "The operator's address. Everything else is denied by omission."
+    dynamic "ip_security_restriction" {
+      for_each = { for i, ip in var.allowed_source_ips : "allow-${i}" => ip }
+      content {
+        name             = ip_security_restriction.key
+        action           = "Allow"
+        ip_address_range = "${ip_security_restriction.value}/32"
+        description      = "Permitted operator address. Everything else is denied by omission."
+      }
     }
 
     traffic_weight {

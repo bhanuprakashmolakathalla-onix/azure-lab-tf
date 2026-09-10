@@ -108,20 +108,48 @@ cd infra\network     ; terraform init ; terraform apply
 cd ..\foundation     ; terraform init ; terraform apply
 cd ..\workspace      ; terraform init ; terraform apply
 cd ..\governance     ; terraform init ; terraform apply
-cd ..\jumpbox        ; terraform init ; terraform apply -var="allowed_source_ip=<your ip>" -var="admin_password=<password>"
+cd ..\jumpbox        ; terraform init
+# Detects your public address rather than asking you to paste one. Both values
+# are validated at plan time, so a placeholder fails immediately instead of
+# becoming a firewall rule for an address that cannot exist.
+$ip = (Invoke-RestMethod https://api.ipify.org).Trim()
+terraform apply -var="allowed_source_ip=$ip" -var="admin_password=<a 12+ char password, 3 of: lower upper digit symbol>"
 ```
 
-Everything after this point talks to the Databricks workspace, whose hostname resolves
-only inside the transit or workspace VNet. **RDP to the jumpbox, clone the repo there, and
-continue:**
+Everything after this point talks to the Databricks workspace, whose hostname resolves only
+inside the transit or workspace VNet. Run it from the laptop and Terraform reaches the
+workspace and is refused: `Unauthorized network access to workspace`. That is the private
+endpoint working, not a permissions problem.
+
+**RDP in** with `mstsc /v:<public_ip>`, then in an **elevated** PowerShell:
 
 ```powershell
-cd data\catalog      ; terraform init ; terraform apply
-cd ..\pipelines      ; terraform init ; terraform apply
-# run the fashion-medallion job once, so gold has something in it
-cd ..\..\app         ; az acr build --registry <acr> --image fashion-app:v1 .
-cd deploy            ; terraform init ; terraform apply
+Set-ExecutionPolicy -Scope Process Bypass -Force
+iwr https://raw.githubusercontent.com/<owner>/azure-lab-tf/main/infra/bootstrap/jumpbox-setup.ps1 -OutFile setup.ps1
+.\setup.ps1
 ```
+
+The image is bare Windows Server: no Azure CLI, no Terraform, no repo. That script installs
+all three, signs you in, and then **resolves the workspace hostname** — which must come back
+as a `10.10.1.x` address. If it resolves to a public one, the private endpoint's DNS zone
+group is wrong and every apply below will hang and then time out with an error that says
+nothing about DNS. Check it before spending twenty minutes finding out the hard way.
+
+Then, still on the jumpbox:
+
+```powershell
+cd C:\lab\azure-lab-tf\data\catalog ; terraform init ; terraform apply
+cd ..\pipelines                     ; terraform init ; terraform apply
+# run the fashion-medallion job once from the Databricks UI, so gold has something in it
+cd ..\..\app                        ; az acr build --registry <acr> --image fashion-app:v1 .
+cd deploy                           ; terraform init
+terraform apply -var='allowed_source_ips=["<your laptop ip>"]'
+```
+
+`allowed_source_ips` is the only thing standing between two public FQDNs and the internet,
+and it has no default on purpose. Give it the address of whatever will **browse** the sites.
+That is your laptop, not the jumpbox — and if you want both, list both, because the transit
+VNet has no NAT gateway so the jumpbox presents its own public address.
 
 `terraform output shop_url` and `terraform output console_url` are the two links.
 
@@ -314,21 +342,59 @@ Measured DBU rates, from `data/analysis/cost_attribution.sql`:
 All-purpose compute costs **1.83× job compute for identical hardware**. One interactive
 cluster used for a few queries cost more than every pipeline run of a fortnight combined.
 
-What actually runs up a bill on this build, and what each lever does:
+### What it costs to stand still
+
+Rates below are Central India retail, pulled from the Azure retail price API rather than
+estimated. They are what the platform charges **for existing**, whether or not anything runs:
+
+| Resource | Count | ₹/hour |
+|---|---|---|
+| Jumpbox `Standard_E4bs_v5`, Windows | 1 | 47.20 |
+| Private endpoints | 5 | 4.78 |
+| NAT gateway | 1 | 4.30 |
+| Jumpbox OS disk, Premium P10 | 1 | 2.58 |
+| Public IPs, Standard static | 2 | 0.96 |
+| Container registry, Basic | 1 | 0.66 |
+| **Standing total** | | **60.48** |
+
+The five private endpoints are the price of the private architecture: two for storage
+(`dfs` and `blob`) and three for the workspace (back-end, front-end, browser auth). They are
+not optional if the workspace has no public path.
+
+Left running for a day that is **₹1,452**, which eats a ₹15,000 monthly budget in ten days.
+Deallocating the jumpbox drops it to **₹13.28/hour**, or ₹319/day — still ₹9,500 a month for
+a lab nobody is using. The teardown script is the only real control.
+
+### What it costs to do something
 
 | Resource | Rate | Lever |
 |---|---|---|
-| NAT gateway | ~₹100/day | required for cluster egress; Azure Firewall would be 10× |
-| Jumpbox `E4bs_v5` | ~₹33/hour running | `az vm deallocate`; auto-shutdown at 23:00 IST |
-| Container registry | Basic ~₹15/day | `acr_sku`. Premium is ~10× and buys only a private endpoint |
-| Serverless SQL warehouse | ~₹250/hour running | `warehouse_auto_stop_mins`, and the in-process catalogue cache |
-| Job cluster, single node | ~₹45/hour | runs only while the job runs |
-| Container Apps | ~0 idle | `min_replicas = 0` |
-| State storage | ~₹5/month | left standing on purpose |
+| Serverless SQL warehouse, 2X-Small | ₹294/hour running (4 DBU × ₹73.57) | `warehouse_auto_stop_mins`, and the in-process catalogue cache |
+| Job cluster, single-node `D4ds_v5` | ₹52/hour (₹23.31 VM + ~1 DBU × ₹28.66) | runs only while the job runs |
+| Container Apps | ~₹0 | `min_replicas = 0`, and the monthly free grant covers a session |
+| Log Analytics, storage, state | ~₹0 | below the free grants at this volume |
 
-A build, a session of clicking around, and a teardown in the same day lands in the low
-hundreds of rupees. The two settings that dominate it are the jumpbox being deallocated
-when you are not on it, and the whole thing being torn down when you are done.
+One number there is an assumption rather than a quote: `Standard_D4ds_v5` is taken as 1.0
+DBU/hour. Everything else is a published rate.
+
+### A build, a session, a teardown
+
+Three hours of wall clock, one pipeline run, fifteen minutes of clicking:
+
+| | ₹ |
+|---|---|
+| Standing cost, 3 hours | 181 |
+| Pipeline run, ~15 min | 13 |
+| SQL warehouse, ~25 min awake | 123 |
+| **Total** | **~320** |
+
+The warehouse is awake longer than you are clicking because of the ten-minute auto-stop tail.
+That tail is deliberate: restarting on every request costs more in patience than it saves in
+rupees. The catalogue cache is what keeps browsing from extending it.
+
+Switching `serving_compute` to `"cluster"` cuts the compute rate to about a quarter, and is
+still usually the worse deal for a short session: it has to stay up through a twenty-minute
+idle timeout while a serverless warehouse bills only while a query is in flight.
 
 Decisions that mattered more than the numbers:
 

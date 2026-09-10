@@ -60,6 +60,14 @@
     .\teardown.ps1 -Scope Azure -WhatIf
 #>
 
+# Not a credential. Terraform validates every required variable before it works
+# out that a destroy will never read this one, so a destroy of infra/jumpbox
+# fails without a syntactically valid password. Making it a SecureString would
+# mean marshalling it back to plain text one line later to put it on a command
+# line, which is worse theatre than saying plainly what it is.
+[Diagnostics.CodeAnalysis.SuppressMessageAttribute(
+    'PSAvoidUsingPlainTextForPassword', 'AdminPassword',
+    Justification = 'Placeholder to satisfy a required variable during destroy; never authenticates anything.')]
 [CmdletBinding()]
 param(
     [ValidateSet("Databricks", "Azure", "All")]
@@ -171,9 +179,15 @@ function Invoke-Destroy {
         Write-Host "`n--- $Dir" -ForegroundColor Cyan
         terraform init -input=false -upgrade=false | Out-Null
 
+        # Modules whose variables have no defaults still need values on a
+        # DESTROY, even though nothing reads them. Terraform validates inputs
+        # before it decides what to do with them.
         $extra = @()
         if ($Dir -eq "infra/jumpbox") {
             $extra = @("-var", "allowed_source_ip=$AllowedSourceIp", "-var", "admin_password=$AdminPassword")
+        }
+        if ($Dir -eq "app/deploy") {
+            $extra = @("-var", "allowed_source_ips=[`"$AllowedSourceIp`"]")
         }
 
         terraform destroy -auto-approve -input=false @extra

@@ -70,13 +70,34 @@ variable "image_tag" {
   default     = "v1"
 }
 
-# The ONLY guard on the two public ingress FQDNs. A Container Apps ingress with
+# THE ONLY GUARD on the two public ingress FQDNs. A Container Apps ingress with
 # no restriction is reachable by the entire internet, and the console can cancel
 # orders.
-variable "allowed_source_ip" {
-  description = "Public IP permitted to reach both sites. Same value as the jumpbox NSG rule."
-  type        = string
-  default     = "106.222.203.222"
+#
+# A LIST, and with NO DEFAULT, both deliberately.
+#
+# It was a single string with a hardcoded address, which is wrong twice. A home
+# IP changes, so the committed default goes stale and silently locks you out of
+# your own site - a failure that looks like a broken deployment. And there is
+# more than one machine in play: the laptop browses the sites, the jumpbox is
+# what deployed them, and the source address Container Apps sees differs between
+# them because the transit VNet has no NAT gateway.
+#
+# No default means you have to say. That is the right amount of friction for the
+# one line standing between a public FQDN and the internet.
+variable "allowed_source_ips" {
+  description = "Public IPs permitted to reach the storefront and the console. Your laptop, and the jumpbox if you want to browse from there."
+  type        = list(string)
+
+  validation {
+    condition     = length(var.allowed_source_ips) > 0
+    error_message = "Give at least one address. An empty list would publish both sites to the internet, which is not a default worth having."
+  }
+
+  validation {
+    condition     = alltrue([for ip in var.allowed_source_ips : can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}$", ip))])
+    error_message = "Each entry must be a bare IPv4 address with no mask - the /32 is added for you."
+  }
 }
 
 # THE COST LEVER for the serving tier.
