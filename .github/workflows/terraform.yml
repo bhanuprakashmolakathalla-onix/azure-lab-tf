@@ -43,9 +43,14 @@ env:
 
   TF_IN_AUTOMATION: "true"
 
+  # Where every module keeps its state. Only the upstream-state guard reads it
+  # directly; Terraform gets it from each module's backend.tf.
+  STATE_ACCOUNT: sttfstatebhanu7391
+
 jobs:
   terraform:
     runs-on: ubuntu-latest
+    name: terraform (${{ matrix.module }})
 
     # Modules run in DEPENDENCY ORDER, not in parallel. Each reads the previous
     # one's outputs through terraform_remote_state, so workspace cannot plan
@@ -88,7 +93,30 @@ jobs:
         # governance is independent - it reads no other module's state - but runs
         # last so a subscription-level guardrail is never applied before the
         # things it guards exist.
-        module: [infra/network, infra/foundation, infra/workspace, infra/governance]
+        #
+        # `requires` NAMES THE UPSTREAM STATE KEYS, and it exists because this
+        # lab is torn down more often than it is up.
+        #
+        # A module that reads `terraform_remote_state` cannot plan until the
+        # module it reads has been APPLIED. On a pull request nothing applies, so
+        # with the lab destroyed, foundation plans against a network state whose
+        # outputs are `{}` and dies with "this object does not have an attribute
+        # named dns_zone_ids". That is a correct failure and a useless signal:
+        # every PR goes red for a reason that has nothing to do with the diff,
+        # and people stop reading the check.
+        #
+        # The guard below reads these blobs and decides between "your change is
+        # broken" and "there is nothing here to plan against". Only the first is
+        # worth failing over.
+        include:
+          - module: infra/network
+            requires: ""
+          - module: infra/foundation
+            requires: "network.tfstate"
+          - module: infra/workspace
+            requires: "network.tfstate foundation.tfstate"
+          - module: infra/governance
+            requires: ""
 
     defaults:
       run:
@@ -125,11 +153,55 @@ jobs:
       - name: Validate
         run: terraform validate
 
+      # IS THERE ANYTHING TO PLAN AGAINST?
+      #
+      # Note where this sits: AFTER fmt and validate, and before plan. Those two
+      # check the diff itself and are worth running whether or not any
+      # infrastructure exists - a badly formatted or invalid module should fail a
+      # PR on an empty subscription just as loudly as on a full one.
+      #
+      # `terraform plan` is different. It needs the upstream module's OUTPUTS,
+      # and a state file that exists but holds `"outputs": {}` is what a
+      # destroyed module looks like. Terraform then fails with an attribute
+      # error pointing at a line nobody touched.
+      #
+      # An empty state is not the same thing as a missing one, and neither is a
+      # broken change. Reading the blob is the only way to tell them apart before
+      # spending a plan on it.
+      - name: Upstream state
+        id: upstream
+        run: |
+          ready=true
+          # Quoted into a variable first. An empty word list after `in` is legal in
+          # bash 5 and a parse error in stricter shells; an empty VARIABLE simply
+          # expands to zero words everywhere.
+          requires="${{ matrix.requires }}"
+          for key in $requires; do
+            outputs=0
+            if az storage blob download \
+                 --account-name "${STATE_ACCOUNT}" \
+                 --container-name tfstate \
+                 --name "$key" \
+                 --auth-mode login \
+                 --file "/tmp/$key" \
+                 --no-progress --output none 2>/dev/null; then
+              outputs=$(jq -r '.outputs | length' "/tmp/$key" 2>/dev/null || echo 0)
+            fi
+            if [ "${outputs:-0}" -eq 0 ]; then
+              echo "not applied: $key has no outputs"
+              ready=false
+            else
+              echo "ready: $key has $outputs outputs"
+            fi
+          done
+          echo "ready=$ready" >> "$GITHUB_OUTPUT"
+
       # -detailed-exitcode: 0 = no changes, 2 = changes present, 1 = error.
       # Distinguishing "no drift" from "drift" from "broken" is what lets a
       # scheduled run become drift detection later.
       - name: Plan
         id: plan
+        if: steps.upstream.outputs.ready == 'true'
         run: |
           set +e
           terraform plan -input=false -no-color -out=tfplan -detailed-exitcode
@@ -154,6 +226,29 @@ jobs:
         if: always()
         run: |
           M="${{ matrix.module }}"
+
+          # THREE outcomes, not two, and the middle one is the point.
+          #
+          # "not applied" means the lab is torn down and this module has nothing
+          # to plan against. It is reported and it is not a failure - the module
+          # was still formatted and validated above. Collapsing it into "plan did
+          # not complete" would put a red mark on every PR raised while the lab
+          # is down, which is most of them.
+          if [ "${{ steps.upstream.outputs.ready }}" != "true" ]; then
+            {
+              echo "## \`$M\`"
+              echo ""
+              echo "### ⏸️ Nothing to plan against"
+              echo ""
+              echo "Upstream state (\`${{ matrix.requires }}\`) holds no outputs, so this"
+              echo "module has not been applied. Formatting and validation still ran."
+              echo ""
+              echo "This is what a torn-down lab looks like, not a broken change."
+            } > summary.md
+            cat summary.md >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
           if [ ! -f tfplan ]; then
             echo "### \`$M\` — plan did not complete" > summary.md
             cat summary.md >> "$GITHUB_STEP_SUMMARY"
@@ -249,6 +344,16 @@ jobs:
       # Apply ONLY from main, and only the plan file that was just reviewed.
       # Applying `tfplan` rather than re-planning means what runs is exactly what
       # was shown - no window for the world to change underneath you.
+      #
+      # The upstream guard is repeated here for a reason worth stating: on main
+      # the modules run one at a time in dependency order, so by the time this
+      # job starts, the module it depends on has ALREADY applied in the previous
+      # job and its outputs exist. The guard therefore passes on main even when
+      # it failed for the same commit on the PR, and the chain builds itself from
+      # an empty subscription in one run.
       - name: Apply
-        if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+        if: |
+          github.ref == 'refs/heads/main'
+          && github.event_name != 'pull_request'
+          && steps.upstream.outputs.ready == 'true'
         run: terraform apply -input=false -auto-approve tfplan
