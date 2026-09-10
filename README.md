@@ -108,7 +108,12 @@ cd infra\network     ; terraform init ; terraform apply
 cd ..\foundation     ; terraform init ; terraform apply
 cd ..\workspace      ; terraform init ; terraform apply
 cd ..\governance     ; terraform init ; terraform apply
-cd ..\jumpbox        ; terraform init ; terraform apply -var="allowed_source_ip=<your ip>" -var="admin_password=<password>"
+cd ..\jumpbox        ; terraform init
+# Detects your public address rather than asking you to paste one. Both values
+# are validated at plan time, so a placeholder fails immediately instead of
+# becoming a firewall rule for an address that cannot exist.
+$ip = (Invoke-RestMethod https://api.ipify.org).Trim()
+terraform apply -var="allowed_source_ip=$ip" -var="admin_password=<a 12+ char password, 3 of: lower upper digit symbol>"
 ```
 
 Everything after this point talks to the Databricks workspace, whose hostname resolves

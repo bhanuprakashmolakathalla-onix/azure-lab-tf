@@ -14,6 +14,17 @@ variable "state_storage_account_name" {
 variable "allowed_source_ip" {
   description = "Your public IP. RDP is permitted from here and nowhere else."
   type        = string
+
+  # Catch a placeholder at PLAN time rather than letting it become an NSG rule.
+  #
+  # `-var="allowed_source_ip=<your ip>"` copied straight out of a README is
+  # accepted by Terraform, plans four resources cleanly, and produces a firewall
+  # rule for a source address that cannot exist. Nothing errors, and the machine
+  # is simply unreachable - a failure that looks like networking and is not.
+  validation {
+    condition     = can(regex("^([0-9]{1,3}\\.){3}[0-9]{1,3}$", var.allowed_source_ip))
+    error_message = "allowed_source_ip must be a bare IPv4 address with no mask - the /32 is added for you. Get it with: (Invoke-RestMethod https://api.ipify.org).Trim()"
+  }
 }
 
 # No default, and never committed. Terraform state does hold it, which is why
@@ -22,6 +33,25 @@ variable "admin_password" {
   description = "Local administrator password for the jumpbox."
   type        = string
   sensitive   = true
+
+  # AZURE'S RULE, ENFORCED HERE INSTEAD OF THERE.
+  #
+  # Azure wants 12-123 characters and THREE of these four: lowercase, uppercase,
+  # a digit, a special character. Left to Azure, that check happens after the
+  # whole plan has been built and printed - the error arrives at the very last
+  # resource, under a wall of green plan output nobody reads twice.
+  #
+  # Same argument as the storage account name validation in foundation: a rule
+  # that is knowable at plan time should fail at plan time.
+  validation {
+    condition = length(var.admin_password) >= 12 && length(var.admin_password) <= 123 && (
+      (can(regex("[a-z]", var.admin_password)) ? 1 : 0) +
+      (can(regex("[A-Z]", var.admin_password)) ? 1 : 0) +
+      (can(regex("[0-9]", var.admin_password)) ? 1 : 0) +
+      (can(regex("[^a-zA-Z0-9_]", var.admin_password)) ? 1 : 0)
+    ) >= 3
+    error_message = "admin_password must be 12-123 characters and satisfy 3 of 4: lowercase, uppercase, digit, special character other than underscore."
+  }
 }
 
 variable "admin_username" {
