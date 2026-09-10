@@ -61,25 +61,33 @@ jobs:
         # Dependency order, and it is load-bearing. workspace reads foundation;
         # everything downstream reads workspace.
         #
-        # `compute` is deliberately absent: it starts a cluster, and a merge to
-        # main should not begin billing DBUs. governance is independent - it
-        # reads no other module state - but runs last so a subscription-level
-        # guardrail is never applied before the things it guards exist.
+        # FOUR of the nine root modules. What is missing, and why:
         #
-        # data/catalog AND data/pipelines ARE DELIBERATELY ABSENT, and this is
-        # not a temporary omission.
+        # data/catalog, data/pipelines, app/deploy and infra/compute ARE
+        # DELIBERATELY ABSENT, and it is not a temporary omission.
         #
-        # Both use the `databricks` provider, whose host is the workspace URL.
-        # Since public_network_access_enabled = false, that name resolves only
-        # inside the transit or workspace VNet. A GitHub-HOSTED runner is on
+        # All four use the `databricks` provider, whose host is the workspace
+        # URL. Since public_network_access_enabled = false, that name resolves
+        # only inside the transit or workspace VNet. A GitHub-HOSTED runner is on
         # Microsoft public infrastructure, outside both, so those modules cannot
         # run there - not slowly, not with a token, not at all.
         #
         # The real fix is a SELF-HOSTED runner inside the VNet, which is exactly
         # why regulated organisations run their own runner fleets. Until then
-        # those two modules are applied from the jumpbox by hand, and CI covers
-        # only the azurerm modules, which reach ARM over the public internet and
-        # are unaffected.
+        # they are applied from the jumpbox by hand, and CI covers the azurerm
+        # modules, which reach ARM over the public internet and are unaffected.
+        #
+        # infra/compute would be absent anyway: applying it STARTS a cluster, and
+        # a merge to main should not begin billing DBUs.
+        #
+        # infra/jumpbox is absent for a duller reason - it takes two variables
+        # with no defaults, one of them a password. Putting a password in CI to
+        # build the machine whose whole purpose is keeping CI out would be a
+        # strange thing to do.
+        #
+        # governance is independent - it reads no other module's state - but runs
+        # last so a subscription-level guardrail is never applied before the
+        # things it guards exist.
         module: [infra/network, infra/foundation, infra/workspace, infra/governance]
 
     defaults:

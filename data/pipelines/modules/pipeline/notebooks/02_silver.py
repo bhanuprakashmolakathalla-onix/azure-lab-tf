@@ -12,7 +12,7 @@
 
 from pyspark.sql import functions as F
 
-dbutils.widgets.text("catalog", "dev")
+dbutils.widgets.text("catalog", "fashion")
 CATALOG = dbutils.widgets.get("catalog")
 
 products = spark.read.table(f"{CATALOG}.bronze.products")
@@ -22,12 +22,30 @@ valid_skus = products.select("sku").distinct()
 # Rules, named. The name reaches the quarantine table and any alert built on it.
 # ---------------------------------------------------------------------------
 
+# THE RULE EVERY STREAM SHARES.
+#
+# Auto Loader was told `rescuedDataColumn = _rescued_data` in bronze, so a field
+# that did not fit the inferred schema is kept there instead of being dropped or
+# killing the batch. Bronze deliberately does nothing with it - bronze is a log
+# of what arrived.
+#
+# This is the promise bronze makes on silver's behalf, and until now silver was
+# not keeping it: a non-null _rescued_data means the row parsed only partially,
+# which is a data-quality failure whatever else about the row looks valid.
+RESCUED_RULE = {"no_rescued_fields": F.col("_rescued_data").isNull()}
+
+
 def quarantine(df, rules, target, source):
     """Split a dataframe on named rules. Good rows returned, bad rows persisted."""
     violations = F.array_compact(
         F.array(*[F.when(~cond, F.lit(name)).otherwise(F.lit(None)) for name, cond in rules.items()])
     )
-    checked = df.withColumn("_violations", violations)
+    # CACHED, and it matters more than it looks. Below this line the same plan is
+    # walked five times - two counts, a violation breakdown, the quarantine write
+    # and the caller's own write - and without a cache Spark recomputes every
+    # upstream join each time. On a single-node cluster that is most of the
+    # notebook's runtime, spent re-deriving rows it already had.
+    checked = df.withColumn("_violations", violations).cache()
     good = checked.filter(F.size("_violations") == 0).drop("_violations")
     bad = checked.filter(F.size("_violations") > 0)
 
@@ -39,7 +57,7 @@ def quarantine(df, rules, target, source):
         .saveAsTable(target)
     )
 
-    total, kept, rejected = df.count(), good.count(), bad.count()
+    total, kept, rejected = checked.count(), good.count(), bad.count()
     print(f"{source}: {total} in, {kept} kept, {rejected} quarantined ({rejected / total * 100 if total else 0:.2f}%)")
     if rejected:
         bad.select(F.explode("_violations").alias("rule")).groupBy("rule").count().orderBy(F.desc("count")).show(truncate=False)
@@ -64,6 +82,7 @@ sales_raw = (
 sales_raw = sales_raw.join(valid_skus.withColumn("_sku_known", F.lit(True)), "sku", "left")
 
 sales_rules = {
+    **RESCUED_RULE,
     "known_sku": F.col("_sku_known").isNotNull(),
     "positive_quantity": F.col("quantity") > 0,
     "positive_price": F.col("unit_price") > 0,
@@ -85,6 +104,7 @@ sale_keys = sales.select(F.col("transaction_id").alias("_txn"), F.col("sale_date
 returns_raw = returns_raw.join(sale_keys, returns_raw.transaction_id == F.col("_txn"), "left")
 
 returns_rules = {
+    **RESCUED_RULE,
     # An orphan return cannot be netted off anything, and silently dropping it
     # would overstate revenue - exactly the error this layer exists to prevent.
     "matched_to_sale": F.col("_txn").isNotNull(),
@@ -108,6 +128,7 @@ inventory_raw = (
 )
 
 inventory_rules = {
+    **RESCUED_RULE,
     "known_sku": F.col("_sku_known").isNotNull(),
     "non_negative_on_hand": F.col("on_hand") >= 0,
     "non_negative_on_order": F.col("on_order") >= 0,

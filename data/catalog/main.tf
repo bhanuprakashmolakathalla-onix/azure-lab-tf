@@ -227,16 +227,25 @@ module "catalog" {
   #
   # Grants also INHERIT downward: SELECT here applies to every schema and table
   # in the catalog, including ones that do not exist yet. That makes catalog-level
-  # SELECT a bigger decision than it looks.
+  # SELECT a bigger decision than it looks, and it is why analysts do not get one.
   catalog_grants = {
     (databricks_group.engineers.display_name) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "SELECT", "MODIFY"]
 
-    # Analysts read, and only read. No MODIFY, no CREATE_TABLE.
-    (databricks_group.analysts.display_name) = ["USE_CATALOG", "USE_SCHEMA", "SELECT"]
+    # Traversal only. Analysts get their SELECT one level down, on gold, so that
+    # adding a schema tomorrow does not silently widen what they can read.
+    (databricks_group.analysts.display_name) = ["USE_CATALOG"]
 
     # The pipeline identity. Keyed by APPLICATION ID - UC identifies service
     # principals that way, not by display name the way it does groups.
     (var.ci_application_id) = ["USE_CATALOG", "USE_SCHEMA", "CREATE_SCHEMA", "CREATE_TABLE", "MODIFY", "SELECT"]
+  }
+
+  # Where the layers stop being uniform. Analysts see the marts and nothing else
+  # - not bronze, not silver, not the order book.
+  schema_grants = {
+    gold = {
+      (databricks_group.analysts.display_name) = ["USE_SCHEMA", "SELECT"]
+    }
   }
 
   depends_on = [databricks_external_location.layers]

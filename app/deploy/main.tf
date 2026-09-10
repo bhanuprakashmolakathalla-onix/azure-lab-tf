@@ -1,20 +1,23 @@
-# The serving tier: a container that reads the gold layer and shows it to people.
+# The serving tier: two sites over one lakehouse.
 #
 # ---------------------------------------------------------------------------
-# THE IDENTITY CHAIN, which is the genuinely interesting part
+# WHAT GETS BUILT
 #
-#   azurerm_user_assigned_identity        an Azure identity for the container
-#          |  client_id
-#          v
-#   databricks_service_principal          the SAME identity, known to Databricks
-#          |
-#          +-- assigned into the workspace           (may enter)
-#          +-- CAN_USE / CAN_RESTART on compute      (may run queries)
-#          +-- USE CATALOG / USE SCHEMA / SELECT     (may read gold)
+#   ca-fashion-shop      the storefront. Browse, choose a size, place an order.
+#   ca-fashion-console   the operations console. Work the order book, read the
+#                        marts, see what the pipeline quarantined.
 #
-# Four separate gates - existence, assignment, compute permission, data
-# privilege. The container holds no secret; it asks Azure for a token at runtime
-# and Databricks recognises the caller.
+# ONE image, TWO container apps, TWO identities. The image is shared because the
+# code is; the identities are separate because the privileges are:
+#
+#                        gold    silver   ops
+#   shop identity        read      -      read + write + create
+#   console identity     read    read     read + write
+#
+# The shop can take an order and cannot look at the silver layer. The console
+# can see everything the pipeline produced and cannot create a table. Neither
+# holds a secret - each asks Azure for a token at runtime and Databricks
+# recognises the caller.
 #
 # ---------------------------------------------------------------------------
 # THE NETWORK SHAPE, which is what "public app, private everything" means
@@ -24,11 +27,11 @@
 #                    v
 #            snet-apps 10.10.4.0/23   <- workloads run IN the transit VNet
 #                    |
-#                    +-> ACR private endpoint          (image pull)
-#                    +-> Databricks frontend PE 10.10.1.4 (queries)
+#                    +-> Databricks frontend private endpoint (queries)
 #
-# The only public surface is the ingress FQDN. Everything the app TALKS TO is
-# reached over private addresses inside the VNet.
+# The only public surface is the two ingress FQDNs, and each is locked to one
+# source address. Everything the apps TALK TO is reached over private addresses
+# inside the VNet.
 # ---------------------------------------------------------------------------
 
 data "terraform_remote_state" "workspace" {
@@ -56,6 +59,10 @@ data "terraform_remote_state" "network" {
 locals {
   ws  = data.terraform_remote_state.workspace.outputs
   net = data.terraform_remote_state.network.outputs
+
+  # Premium is the only SKU that supports private endpoints. Everything else the
+  # two apps need is in Basic.
+  acr_private = var.acr_sku == "Premium"
 }
 
 resource "azurerm_resource_group" "serving" {
@@ -66,28 +73,33 @@ resource "azurerm_resource_group" "serving" {
 
 # --- Registry -------------------------------------------------------------
 #
-# PREMIUM, and only because private endpoints require it. Basic would be a fifth
-# of the cost and identical in every feature this app uses.
+# BASIC by default, and that is a deliberate change from Premium.
 #
-# admin_enabled stays FALSE. Turning it on creates a username/password pair that
-# works from anywhere - the exact long-lived credential this repo has avoided
-# throughout. The container pulls with its managed identity instead.
+# Premium buys exactly one thing here - a private endpoint for the image pull -
+# and costs roughly ten times as much per day. For a lab that is built in the
+# morning and destroyed in the evening, that is the single largest avoidable
+# line on the bill, spent on closing a path that is already Entra-authenticated
+# with no keys to leak.
 #
-# HONEST LIMITATION, stated rather than hidden: public_network_access stays
-# ENABLED. `az acr build` runs on ACR Tasks infrastructure, which lives outside
-# your VNet and cannot reach a registry whose public endpoint is closed. The
-# production answer is a Premium DEDICATED AGENT POOL injected into the VNet,
-# which is more cost and more moving parts than a one-day lab warrants.
+# Set acr_sku = "Premium" and the private endpoint below appears. The variable
+# exists because this IS the right call in production and the wrong one for a
+# day: an image pull happens on every scale-out, continuously, and in a regulated
+# environment it should not traverse a public endpoint even an authenticated one.
 #
-# What the private endpoint below still buys: the container app's image PULL -
-# the path that runs continuously, on every scale-out - resolves to a private
-# address and never leaves the VNet. The public endpoint remains, but it is
-# Entra-authenticated with no keys to leak.
+# admin_enabled stays FALSE either way. Turning it on creates a username and
+# password pair that works from anywhere - the exact long-lived credential this
+# repo has avoided throughout. Both apps pull with their managed identity.
+#
+# HONEST LIMITATION even on Premium: public_network_access stays enabled,
+# because `az acr build` runs on ACR Tasks infrastructure outside your VNet and
+# cannot reach a registry whose public endpoint is closed. The production answer
+# is a dedicated agent pool injected into the VNet, which is more cost and more
+# moving parts than a one-day lab warrants.
 resource "azurerm_container_registry" "acr" {
   name                          = var.acr_name
   resource_group_name           = azurerm_resource_group.serving.name
   location                      = azurerm_resource_group.serving.location
-  sku                           = "Premium"
+  sku                           = var.acr_sku
   admin_enabled                 = false
   public_network_access_enabled = true
   tags                          = var.tags
@@ -95,17 +107,21 @@ resource "azurerm_container_registry" "acr" {
 
 # privatelink.azurecr.io - same interception mechanism as the Databricks zones.
 # The name is not ours to choose; it is what Azure's public CNAME chain points
-# at, and matching it exactly is what makes the private resolution happen.
+# at, and matching it exactly is what makes private resolution happen.
 resource "azurerm_private_dns_zone" "acr" {
+  count = local.acr_private ? 1 : 0
+
   name                = "privatelink.azurecr.io"
   resource_group_name = local.net.transit_resource_group
   tags                = var.tags
 }
 
 resource "azurerm_private_dns_zone_virtual_network_link" "acr_transit" {
+  count = local.acr_private ? 1 : 0
+
   name                  = "link-transit"
   resource_group_name   = local.net.transit_resource_group
-  private_dns_zone_name = azurerm_private_dns_zone.acr.name
+  private_dns_zone_name = azurerm_private_dns_zone.acr[0].name
   virtual_network_id    = local.net.transit_vnet_id
   registration_enabled  = false
   tags                  = var.tags
@@ -116,6 +132,8 @@ resource "azurerm_private_dns_zone_virtual_network_link" "acr_transit" {
 # cover only the first and pulls fail after authenticating, which reads like a
 # permissions problem and is not one.
 resource "azurerm_private_endpoint" "acr" {
+  count = local.acr_private ? 1 : 0
+
   name                = "pe-${var.acr_name}"
   resource_group_name = azurerm_resource_group.serving.name
   location            = azurerm_resource_group.serving.location
@@ -131,11 +149,11 @@ resource "azurerm_private_endpoint" "acr" {
 
   private_dns_zone_group {
     name                 = "dns-acr"
-    private_dns_zone_ids = [azurerm_private_dns_zone.acr.id]
+    private_dns_zone_ids = [azurerm_private_dns_zone.acr[0].id]
   }
 }
 
-# --- The application's identity -------------------------------------------
+# --- The applications' identities -----------------------------------------
 #
 # USER-assigned rather than system-assigned, deliberately.
 #
@@ -143,19 +161,42 @@ resource "azurerm_private_endpoint" "acr" {
 # its object id changes on every replacement - and every grant referencing it
 # would have to be reissued. A user-assigned identity outlives the app, so the
 # Databricks registration and all four gates stay valid across redeploys.
+#
+# TWO of them, one per site. It would be less code to share one, and sharing it
+# would mean the public storefront held every privilege the internal console
+# does. An identity is the smallest unit of blast radius available here, and
+# spending a second one is cheap.
 resource "azurerm_user_assigned_identity" "app" {
-  name                = "id-fashion-app"
+  for_each = toset(["shop", "console"])
+
+  name                = "id-fashion-${each.key}"
   resource_group_name = azurerm_resource_group.serving.name
   location            = azurerm_resource_group.serving.location
   tags                = var.tags
 }
 
-# AcrPull, not Contributor. The app reads one image and never writes.
+# AcrPull, not Contributor. The apps read one image and never write.
 resource "azurerm_role_assignment" "acr_pull" {
+  for_each = azurerm_user_assigned_identity.app
+
   scope                            = azurerm_container_registry.acr.id
   role_definition_name             = "AcrPull"
-  principal_id                     = azurerm_user_assigned_identity.app.principal_id
+  principal_id                     = each.value.principal_id
   skip_service_principal_aad_check = true
+}
+
+# --- The bag signing key --------------------------------------------------
+#
+# The storefront keeps the shopping bag in a signed cookie rather than a table -
+# see app/src/cart.py for why. The signature needs a key that is the SAME across
+# replicas and across restarts, or a bag vanishes whenever the app scales.
+#
+# Generated here rather than typed anywhere: it lands in state, which lives in a
+# storage account with shared keys disabled and Entra-only access, and it is
+# never printed. If it were a variable someone would eventually commit it.
+resource "random_password" "cart_secret" {
+  length  = 48
+  special = false
 }
 
 # --- Container Apps -------------------------------------------------------
@@ -181,14 +222,18 @@ resource "azurerm_log_analytics_workspace" "logs" {
 #                                   network with no route to 10.10.1.4
 #
 #   internal_load_balancer_enabled  FALSE deliberately. True would put ingress
-#     = false                       on a private IP too, and you asked for the
-#                                   app to be publicly reachable. The workloads
-#                                   are private; the front door is not.
+#     = false                       on a private IP too, and both sites are meant
+#                                   to be reachable from a laptop. The workloads
+#                                   are private; the front doors are not.
 #
 # The subnet must be /23 or larger and delegated to Microsoft.App/environments -
 # both already true of snet-apps. Container Apps consumes addresses far faster
 # than replica count suggests, which is why the network module sized it /23
 # rather than /24.
+#
+# ONE environment for both apps. An environment is the network and logging
+# boundary, not the security boundary - that is the identity - so a second one
+# would buy nothing and cost another subnet.
 resource "azurerm_container_app_environment" "env" {
   name                           = "cae-fashion"
   resource_group_name            = azurerm_resource_group.serving.name
@@ -199,8 +244,25 @@ resource "azurerm_container_app_environment" "env" {
   tags                           = var.tags
 }
 
-resource "azurerm_container_app" "api" {
-  name                         = "ca-fashion-app"
+locals {
+  apps = {
+    shop = {
+      name  = "ca-fashion-shop"
+      role  = "shop"
+      brand = var.brand_name
+    }
+    console = {
+      name  = "ca-fashion-console"
+      role  = "console"
+      brand = var.brand_name
+    }
+  }
+}
+
+resource "azurerm_container_app" "site" {
+  for_each = local.apps
+
+  name                         = each.value.name
   resource_group_name          = azurerm_resource_group.serving.name
   container_app_environment_id = azurerm_container_app_environment.env.id
   revision_mode                = "Single"
@@ -208,14 +270,19 @@ resource "azurerm_container_app" "api" {
 
   identity {
     type         = "UserAssigned"
-    identity_ids = [azurerm_user_assigned_identity.app.id]
+    identity_ids = [azurerm_user_assigned_identity.app[each.key].id]
   }
 
   # How the app authenticates its own image pull. Naming the identity here is
   # what avoids an ACR admin password.
   registry {
     server   = azurerm_container_registry.acr.login_server
-    identity = azurerm_user_assigned_identity.app.id
+    identity = azurerm_user_assigned_identity.app[each.key].id
+  }
+
+  secret {
+    name  = "cart-secret"
+    value = random_password.cart_secret.result
   }
 
   ingress {
@@ -228,12 +295,14 @@ resource "azurerm_container_app" "api" {
     # The FQDN is world-resolvable; this is what stops the world using it. One
     # allow rule means everything else is denied - Container Apps switches to
     # deny-by-default the moment a single Allow rule exists, so there is no
-    # companion deny rule to write (and writing one would be a mistake).
+    # companion deny rule to write, and writing one would be a mistake.
+    #
+    # The console needs this more than the shop does: it can cancel orders.
     ip_security_restriction {
-      name             = "allow-me"
+      name             = "allow-operator"
       action           = "Allow"
       ip_address_range = "${var.allowed_source_ip}/32"
-      description      = "Bhanu's laptop. Everything else is denied by omission."
+      description      = "The operator's address. Everything else is denied by omission."
     }
 
     traffic_weight {
@@ -243,20 +312,27 @@ resource "azurerm_container_app" "api" {
   }
 
   template {
-    # SCALE TO ZERO. With min_replicas = 0 the app costs nothing when nobody is
+    # SCALE TO ZERO. With min_replicas = 0 an app costs nothing when nobody is
     # calling it - the property that makes Container Apps the right choice over
     # App Service for something used occasionally.
     #
-    # The cost is a cold start on the first request after idle. For an API that
-    # already waits on compute to wake, that is noise.
+    # The cost is a cold start on the first request after idle, and for the shop
+    # that also means an empty catalogue cache and one warehouse wake-up. For a
+    # site someone visits in bursts, that is the right trade.
     min_replicas = 0
-    max_replicas = 2
+    max_replicas = 1
 
     container {
-      name   = "api"
+      name   = "web"
       image  = "${azurerm_container_registry.acr.login_server}/${var.image_name}:${var.image_tag}"
       cpu    = 0.5
       memory = "1Gi"
+
+      # WHICH SITE THIS IS. The image contains both; this one variable decides.
+      env {
+        name  = "APP_ROLE"
+        value = each.value.role
+      }
 
       env {
         name  = "DATABRICKS_SERVER_HOSTNAME"
@@ -272,7 +348,7 @@ resource "azurerm_container_app" "api" {
       # can carry several; without this it has to guess, and guesses wrong.
       env {
         name  = "AZURE_CLIENT_ID"
-        value = azurerm_user_assigned_identity.app.client_id
+        value = azurerm_user_assigned_identity.app[each.key].client_id
       }
 
       env {
@@ -282,12 +358,19 @@ resource "azurerm_container_app" "api" {
 
       env {
         name  = "BRAND_NAME"
-        value = var.brand_name
+        value = each.value.brand
       }
 
+      # Shown in the console footer, so the person reading it knows whether a
+      # slow page is a warehouse waking or a cluster booting.
       env {
         name  = "SERVING_COMPUTE"
         value = var.serving_compute == "warehouse" ? "a serverless SQL warehouse" : "a single-node cluster"
+      }
+
+      env {
+        name        = "CART_SECRET"
+        secret_name = "cart-secret"
       }
 
       # Probes hit /health, which deliberately does NOT touch Databricks. A

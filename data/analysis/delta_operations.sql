@@ -1,7 +1,7 @@
 -- Delta Lake operations against the tables this platform actually built.
 --
 -- Paste one query per notebook cell, %sql on the first line, attached to
--- lab01-single.
+-- lab01-single (infra/compute) or run them from a SQL warehouse.
 --
 -- ---------------------------------------------------------------------------
 -- WHAT A DELTA TABLE IS
@@ -20,148 +20,147 @@
 
 -- 1. The transaction log, in human form.
 --
--- One row per commit. You should see three WRITE operations on bronze - one per
--- pipeline run - and possibly OPTIMIZE rows performed by "System-User", which
--- is predictive optimization doing maintenance you did not schedule (Day 9's
--- largest line item).
+-- One row per commit. bronze.sales is the interesting one: it is written by
+-- Auto Loader, so you get a STREAMING UPDATE per micro-batch rather than one
+-- WRITE per run. You may also see OPTIMIZE rows performed by "System-User",
+-- which is predictive optimization doing maintenance nobody scheduled - and
+-- which shows up on the bill.
 --
--- operationMetrics is the interesting column: numOutputRows, numFiles,
+-- operationMetrics is the column that earns its place: numOutputRows, numFiles,
 -- numRemovedFiles. This is how you answer "what did that job actually do"
 -- without instrumenting the job.
-DESCRIBE HISTORY dev.bronze.taxi_trips;
+DESCRIBE HISTORY fashion.bronze.sales;
 
 
 -- 2. Physical layout - the small-files problem, quantified.
 --
--- numFiles vs sizeInBytes is the number that matters. Auto Loader running
--- frequently produces many small files, and every query then pays to open each
--- one. The rule of thumb is ~1GB per file for scan-heavy tables; anything in the
--- kilobytes means metadata overhead dominates actual reading.
+-- numFiles against sizeInBytes is the number that matters. Auto Loader running
+-- per daily drop produces many small files, and every query then pays to open
+-- each one. The rule of thumb is ~1GB per file for scan-heavy tables; anything
+-- in the kilobytes means metadata overhead dominates actual reading.
 --
--- At this data volume the numbers are tiny and OPTIMIZE will not make queries
--- measurably faster. The point is to see the mechanism before it matters, not to
--- observe a speedup here.
-DESCRIBE DETAIL dev.bronze.taxi_trips;
+-- Expect this table to look bad. It is generated at lab scale, and seeing the
+-- pathology clearly is more useful than hiding it behind more data.
+DESCRIBE DETAIL fashion.bronze.sales;
 
 
--- 3. Time travel by version.
+-- 3. Time travel, and what it is actually for.
 --
--- NOTE version 0 is CREATE TABLE - schema only, zero rows. Schema and first
--- write are separate commits, so the first data version is 1. Worth knowing:
--- "restore to version 0" on a fresh table gives you an empty table, not the
--- original data.
+-- Not a party trick. This is the query you run at 3am when a number moved and
+-- nobody knows why: read the table as it was BEFORE the run, and diff.
 SELECT
-  (SELECT COUNT(*) FROM dev.bronze.taxi_trips VERSION AS OF 1) AS after_run1,
-  (SELECT COUNT(*) FROM dev.bronze.taxi_trips VERSION AS OF 2) AS after_run2,
-  (SELECT COUNT(*) FROM dev.bronze.taxi_trips)                 AS now;
+  (SELECT COUNT(*) FROM fashion.bronze.sales VERSION AS OF 0) AS after_first_commit,
+  (SELECT COUNT(*) FROM fashion.bronze.sales)                 AS now;
 
 
--- 4. Time travel by timestamp.
+-- 4. Who changed what, per commit.
 --
--- More useful in practice than a version number, because incidents are reported
--- in wall-clock time: "the dashboard was wrong at 9am". Adjust the literal to a
--- point after your first run.
---
--- Bounded at BOTH ends. Too old and you get
--- DELTA_TIMESTAMP_EARLIER_THAN_COMMIT_RETENTION naming the earliest valid
--- timestamp; beyond log retention (30 days by default) the versions are gone.
---
--- It ERRORS rather than returning an empty result, which is the behaviour you
--- want - a system that silently returns zero rows for an out-of-range query
--- produces confidently wrong dashboards.
---
--- Adjust the literal to sit between two of your own commits.
-SELECT COUNT(*) FROM dev.bronze.taxi_trips TIMESTAMP AS OF '2026-09-06T09:05:00';
+-- Joining history to metrics tells you whether a version added rows, rewrote
+-- files, or did nothing but compact. Three very different events that all look
+-- identical from the outside.
+SELECT
+  version,
+  timestamp,
+  operation,
+  operationMetrics['numOutputRows']   AS rows_written,
+  operationMetrics['numOutputBytes']  AS bytes_written,
+  operationMetrics['numFiles']        AS files_written
+FROM (DESCRIBE HISTORY fashion.silver.sales)
+ORDER BY version;
 
 
--- 5. What changed between two versions.
+-- 5. The quarantine tables, which are the point of the silver layer.
 --
--- The practical use of the log: not "what does the table say now" but "what did
--- that run add". Set the version numbers from query 1.
-SELECT COUNT(*) AS rows_added_by_run3
+-- Rows are kept WITH the list of rules they broke, so this reads as a data
+-- quality report rather than a mystery. An empty result is a healthy pipeline;
+-- a growing one is an upstream conversation.
+SELECT
+  rule,
+  COUNT(*) AS rows_failing
 FROM (
-  SELECT * FROM dev.bronze.taxi_trips VERSION AS OF 3
-  EXCEPT
-  SELECT * FROM dev.bronze.taxi_trips VERSION AS OF 2
-);
+  SELECT EXPLODE(_violations) AS rule FROM fashion.silver.sales_quarantine
+)
+GROUP BY rule
+ORDER BY rows_failing DESC;
 
 
--- 6. OPTIMIZE with Z-ORDER.
+-- 6. OPTIMIZE with ZORDER, and when it is worth it.
 --
--- Two distinct things in one command:
+-- OPTIMIZE compacts small files into large ones. ZORDER additionally co-locates
+-- rows that share values in the named columns, so a filter on them reads fewer
+-- files - Delta skips a file entirely when its min/max statistics rule it out.
 --
---   bin-packing - rewrite many small files into fewer large ones. Pure
---                 mechanical win, no thought required.
+-- Choose ZORDER columns by what your queries FILTER on, never by what they
+-- group by. Here that is date and store, because every merchandising query is
+-- scoped to a period and often to a location.
 --
---   Z-ORDER     - co-locate rows with similar values in the same files, so that
---                 a filter on those columns can SKIP whole files. This is a real
---                 decision: choose columns you actually filter on, and no more
---                 than three or four. Z-ordering on a column nobody filters by
---                 costs a rewrite and buys nothing.
+-- It is not free: it rewrites the table, which costs compute now to save
+-- compute later. On a lab table it will not pay for itself. On a table queried
+-- fifty times a day it pays for itself before lunch.
+OPTIMIZE fashion.silver.sales ZORDER BY (sale_date, store_id);
+
+
+-- 7. Did it help? Compare numFiles before and after.
+DESCRIBE DETAIL fashion.silver.sales;
+
+
+-- 8. VACUUM - the only thing that actually deletes data.
 --
--- pickup_date because gold aggregates by it; pickup_zip because that is the
--- natural slice for any geographic question.
+-- DRY RUN FIRST, always. It lists what would be removed without removing it.
 --
--- Note this is idempotent-ish: running it again on already-optimized data does
--- almost nothing, which is why predictive optimization can run it unattended.
-OPTIMIZE dev.silver.taxi_trips ZORDER BY (pickup_date, pickup_zip);
-
-
--- 7. Confirm the layout changed.
+-- RETAIN 168 HOURS is the default seven days, and it is a floor rather than a
+-- suggestion: vacuum below the retention interval and a long-running reader
+-- holding an older snapshot will fail mid-query with FileNotFound. Databricks
+-- refuses shorter windows unless you disable the safety check, and the fact
+-- that disabling it is possible is not an argument for doing it.
 --
--- numFiles should drop. Compare against what query 2 showed for silver.
-DESCRIBE DETAIL dev.silver.taxi_trips;
+-- The tradeoff nobody states out loud: your time-travel window and your storage
+-- bill are the same number. Seven days of history costs seven days of dead
+-- files.
+VACUUM fashion.silver.sales RETAIN 168 HOURS DRY RUN;
 
 
--- 8. VACUUM - the one with teeth.
+-- 9. The real thing. Commented out deliberately - read the dry run first.
+-- VACUUM fashion.silver.sales RETAIN 168 HOURS;
+
+
+-- 10. RESTORE, on a copy.
 --
--- OPTIMIZE rewrote files but deleted nothing: the old small files are still on
--- disk, still referenced by older commits, which is what keeps time travel
--- working. VACUUM is what actually reclaims that storage.
+-- The reason to practise this on a scratch table is that RESTORE is itself a
+-- commit: it does not rewind history, it appends a new version whose contents
+-- match an old one. Nothing is lost, which is what makes it safe - and which
+-- surprises people who expect the log to shrink.
+CREATE OR REPLACE TABLE fashion.ops.orders_scratch
+AS SELECT * FROM fashion.gold.daily_sales;
+
+DELETE FROM fashion.ops.orders_scratch WHERE net_revenue > 10000;
+
+SELECT COUNT(*) AS after_delete FROM fashion.ops.orders_scratch;
+
+RESTORE TABLE fashion.ops.orders_scratch TO VERSION AS OF 0;
+
+SELECT COUNT(*) AS after_restore FROM fashion.ops.orders_scratch;
+
+-- The history now shows CREATE, DELETE and RESTORE as three separate commits.
+DESCRIBE HISTORY fashion.ops.orders_scratch;
+
+DROP TABLE fashion.ops.orders_scratch;
+
+
+-- 11. The order book, which is the one table not produced by the pipeline.
 --
--- DRY RUN first, always. It lists what WOULD be deleted.
-VACUUM dev.silver.taxi_trips RETAIN 168 HOURS DRY RUN;
-
-
--- 9. Why the 7-day default exists, and why lowering it is dangerous.
+-- Everything else in this catalog is derived and can be rebuilt from the landing
+-- zone. These rows arrive from the storefront one checkout at a time and exist
+-- nowhere else, which makes this the only table here where a bad VACUUM or a
+-- careless DELETE actually loses information.
 --
--- 168 hours is the default retention. Databricks REFUSES a shorter window unless
--- you explicitly disable the safety check, and the reason is not conservatism:
---
---   - a long-running query that started before VACUUM can still be reading files
---     it is about to delete, and will fail mid-flight
---   - every version older than the window becomes unreadable, so time travel and
---     RESTORE silently lose their range
---
--- The correct response to "VACUUM is not freeing enough space" is almost never
--- to shorten retention. It is to check whether something is writing far more
--- versions than it should.
---
--- Left commented deliberately. Uncomment only to actually reclaim space.
--- VACUUM dev.silver.taxi_trips RETAIN 168 HOURS;
+-- Note the file count against the row count. Delta commits per write, so a
+-- handful of orders produces a handful of files - the small-files problem in its
+-- purest form, and the clearest argument for why an order book belongs in an
+-- operational database with change data capture into the lake.
+SELECT status, COUNT(*) AS orders, ROUND(SUM(total), 0) AS value
+FROM fashion.ops.orders
+GROUP BY status
+ORDER BY orders DESC;
 
-
--- 10. RESTORE - undo, on a scratch copy.
---
--- Run against a copy, not a real table, because RESTORE is a real write: it
--- creates a NEW commit whose contents match the old version. It does not erase
--- history, it appends to it - so a restore is itself undoable, which is the
--- property you want at 3am.
-CREATE OR REPLACE TABLE dev.bronze.taxi_scratch
-AS SELECT * FROM dev.bronze.taxi_trips;
-
-DELETE FROM dev.bronze.taxi_scratch WHERE fare_amount > 10;
-
-SELECT COUNT(*) AS after_delete FROM dev.bronze.taxi_scratch;
-
-RESTORE TABLE dev.bronze.taxi_scratch TO VERSION AS OF 0;
-
-SELECT COUNT(*) AS after_restore FROM dev.bronze.taxi_scratch;
-
--- Note the history now shows the DELETE and the RESTORE as separate commits.
--- Nothing was lost; the log only ever grows.
-DESCRIBE HISTORY dev.bronze.taxi_scratch;
-
-
--- 11. Clean up the scratch table.
-DROP TABLE dev.bronze.taxi_scratch;
+DESCRIBE DETAIL fashion.ops.orders;

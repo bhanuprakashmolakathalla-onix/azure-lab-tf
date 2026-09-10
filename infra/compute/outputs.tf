@@ -6,9 +6,9 @@ output "cluster_name" {
   value = databricks_cluster.single.cluster_name
 }
 
-output "node_type_chosen" {
-  description = "Which SKU Databricks resolved. Worth reading - it is the answer to the Day 1 stockout."
-  value       = data.databricks_node_type.smallest.id
+output "node_type" {
+  description = "Pinned, not discovered. See the note in main.tf about why the data source was wrong here."
+  value       = var.node_type_id
 }
 
 output "spark_version" {

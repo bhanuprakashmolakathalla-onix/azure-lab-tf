@@ -53,7 +53,7 @@ from pyspark.sql.types import (
 )
 
 dbutils.widgets.text("landing_url", "")
-dbutils.widgets.text("catalog", "dev")
+dbutils.widgets.text("catalog", "fashion")
 dbutils.widgets.text("start_date", "2026-08-01")
 dbutils.widgets.text("num_days", "28")
 dbutils.widgets.text("seed", "42")

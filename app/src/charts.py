@@ -1,4 +1,4 @@
-"""Hand-drawn SVG charts.
+"""Hand-drawn SVG charts for the operations console.
 
 No charting library. Every mark is emitted here, which means full control over
 the things libraries get wrong by default: thick marks, heavy gridlines, a number
@@ -7,10 +7,10 @@ on every point, and value-ramps on nominal categories.
 Palette roles are CSS custom properties defined once in the page, so the marks
 below reference roles (--series-1) rather than hex. Colours are the validated
 dark-mode steps; the two-series pair was checked with the palette validator
-(adjacent CVD ΔE 26.8, normal-vision 31.8, both well clear of the floors).
+(adjacent CVD deltaE 26.8, normal-vision 31.8, both well clear of the floors).
 """
 
-from html import escape
+from .fmt import compact, e, pct
 
 # Geometry. The container includes the axis band so nothing gets a nested
 # scrollbar - a common and very visible failure.
@@ -32,14 +32,16 @@ def _nice_max(value: float) -> float:
 
 
 def _fmt(n: float, unit: str = "") -> str:
+    """Axis and label numbers, delegated so a chart and a tile never disagree.
+
+    A percentage is a percentage, money is money, and a bare count is neither -
+    which is the whole reason `unit` exists rather than being inferred from the
+    magnitude.
+    """
     if unit == "%":
-        return f"{n:.1f}%"
-    if abs(n) >= 10_000_000:
-        return f"₹{n / 10_000_000:.2f}Cr"
-    if abs(n) >= 100_000:
-        return f"₹{n / 100_000:.1f}L"
-    if abs(n) >= 1_000:
-        return f"{n / 1000:.1f}k"
+        return pct(n)
+    if unit == "INR":
+        return compact(n)
     return f"{n:,.0f}"
 
 
@@ -77,7 +79,7 @@ def line_chart(points, width=1000, height=260, unit="", label="", series_role="-
         if 0 <= i < n:
             anchor = "start" if i == 0 else "end" if i == n - 1 else "middle"
             xlabels.append(
-                f"<text x='{x(i):.1f}' y='{height - 8}' class='tick' text-anchor='{anchor}'>{escape(str(points[i][0]))}</text>"
+                f"<text x='{x(i):.1f}' y='{height - 8}' class='tick' text-anchor='{anchor}'>{e(str(points[i][0]))}</text>"
             )
 
     # Hover targets are full-height columns, so you never have to hit the line.
@@ -86,13 +88,13 @@ def line_chart(points, width=1000, height=260, unit="", label="", series_role="-
     for i, (lbl, v) in enumerate(points):
         hits.append(
             f"<rect class='hit' x='{x(i) - col_w / 2:.1f}' y='{PAD_T}' width='{col_w:.1f}' height='{inner_h}' "
-            f"data-x='{x(i):.1f}' data-y='{y(v):.1f}' data-label='{escape(str(lbl))}' data-value='{escape(_fmt(v, unit))}'/>"
+            f"data-x='{x(i):.1f}' data-y='{y(v):.1f}' data-label='{e(str(lbl))}' data-value='{e(_fmt(v, unit))}'/>"
         )
 
     # Direct-label the endpoint only — the extreme that matters, not every point.
     last_x, last_v = x(n - 1), points[-1][1]
 
-    return f"""<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="{escape(label)}">
+    return f"""<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="{e(label)}">
       <defs><linearGradient id="fade-{series_role[2:]}" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0%" stop-color="var({series_role})" stop-opacity="0.22"/>
         <stop offset="100%" stop-color="var({series_role})" stop-opacity="0"/>
@@ -108,7 +110,7 @@ def line_chart(points, width=1000, height=260, unit="", label="", series_role="-
     </svg>"""
 
 
-def bar_chart(items, width=480, height=260, unit="", label="", colors=None, icons=None):
+def bar_chart(items, width=480, unit="", label="", colors=None, icons=None):
     """Horizontal bars. One series, one colour — unless `colors` carries status."""
     if not items:
         return "<p class='empty'>no data</p>"
@@ -125,14 +127,14 @@ def bar_chart(items, width=480, height=260, unit="", label="", colors=None, icon
         fill = f"var({colors[i]})" if colors else "var(--series-1)"
         icon = f"{icons[i]} " if icons else ""
         rows.append(
-            f"""<g class="barrow" data-label="{escape(icon + str(name))}" data-value="{escape(_fmt(v, unit))}">
-              <text x="0" y="{y + 15}" class="barlabel">{escape(icon + str(name))}</text>
+            f"""<g class="barrow" data-label="{e(icon + str(name))}" data-value="{e(_fmt(v, unit))}">
+              <text x="0" y="{y + 15}" class="barlabel">{e(icon + str(name))}</text>
               <rect class="bar" x="{PAD_L + 76}" y="{y + 4}" width="{w:.1f}" height="16" rx="4" fill="{fill}"/>
               <text x="{PAD_L + 84 + w:.1f}" y="{y + 16}" class="barvalue">{_fmt(v, unit)}</text>
             </g>"""
         )
 
-    return f"""<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="{escape(label)}">
+    return f"""<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="{e(label)}">
       {''.join(rows)}
     </svg>"""
 
@@ -165,11 +167,11 @@ def grouped_bars(groups, series_names, width=1000, height=260, unit="%", label="
             marks.append(
                 f"""<rect class="bar" x="{bx:.1f}" y="{PAD_T + inner_h - h:.1f}" width="{bar_w:.1f}" height="{h:.1f}"
                   rx="4" fill="var(--series-{si + 1})"
-                  data-label="{escape(f'{name} · {series_names[si]}')}" data-value="{escape(_fmt(v, unit))}"/>"""
+                  data-label="{e(f'{name} · {series_names[si]}')}" data-value="{e(_fmt(v, unit))}"/>"""
             )
-        marks.append(f"<text x='{cx:.1f}' y='{height - 8}' class='tick' text-anchor='middle'>{escape(str(name))}</text>")
+        marks.append(f"<text x='{cx:.1f}' y='{height - 8}' class='tick' text-anchor='middle'>{e(str(name))}</text>")
 
-    return f"""<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="{escape(label)}">
+    return f"""<svg viewBox="0 0 {width} {height}" class="chart" role="img" aria-label="{e(label)}">
       {''.join(grid)}{''.join(marks)}
     </svg>"""
 
@@ -194,17 +196,14 @@ def sparkline(values, width=120, height=32, role="--series-1"):
 
 def table(headers, rows, unit_cols=()):
     """The table view. Every chart has one — values are never color-only."""
-    head = "".join(f"<th>{escape(h)}</th>" for h in headers)
+    head = "".join(f"<th>{e(h)}</th>" for h in headers)
     body = []
     for r in rows:
         cells = "".join(
-            f"<td class='num'>{escape(str(c))}</td>" if i in unit_cols else f"<td>{escape(str(c))}</td>"
+            f"<td class='num'>{e(str(c))}</td>" if i in unit_cols else f"<td>{e(str(c))}</td>"
             for i, c in enumerate(r)
         )
         body.append(f"<tr>{cells}</tr>")
     return f"<table class='data'><thead><tr>{head}</tr></thead><tbody>{''.join(body)}</tbody></table>"
 
 
-# Public alias. main.py formats the KPI tiles with the same rules the charts use,
-# so a tile and its axis never disagree about what "1.2L" means.
-fmt = _fmt

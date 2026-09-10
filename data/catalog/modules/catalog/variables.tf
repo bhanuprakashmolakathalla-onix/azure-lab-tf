@@ -1,5 +1,5 @@
 variable "name" {
-  description = "Catalog name, which is also the environment name."
+  description = "Catalog name."
   type        = string
 }
 
@@ -30,13 +30,20 @@ variable "read_only_workspace_ids" {
 }
 
 variable "catalog_grants" {
-  description = "principal -> privileges at CATALOG level. Inherited by every schema and table beneath."
+  description = "principal -> privileges at CATALOG level. Inherited by every schema and table beneath, so keep this to traversal and creation rights wherever possible."
   type        = map(list(string))
   default     = {}
 }
 
+# schema -> principal -> privileges.
+#
+# Two levels, because this is where the medallion layers stop being uniform.
+# Analysts have no business in bronze; the storefront has no business anywhere
+# except gold and ops. A flat principal -> privileges map could only express
+# "the same everywhere", which is the policy you write when the mechanism cannot
+# express anything better.
 variable "schema_grants" {
-  description = "principal -> privileges applied to every schema in this catalog."
-  type        = map(list(string))
+  description = "schema name -> principal -> privileges. Applied only to the named schema."
+  type        = map(map(list(string)))
   default     = {}
 }

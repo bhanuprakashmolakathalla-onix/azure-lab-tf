@@ -9,10 +9,24 @@ variable "catalog_name" {
   default     = "fashion"
 }
 
+# bronze/silver/gold are the medallion layers, written by the pipeline and read
+# by everything.
+#
+# `ops` is deliberately NOT one of them. It holds the order book the storefront
+# writes at checkout and the console updates as orders move - application state
+# arriving one row at a time from outside the lakehouse, not a layer derived from
+# the layer above it. Putting it in gold would make a mart that no pipeline run
+# produces and no rebuild can reconstruct.
+#
+# BE HONEST ABOUT THE SHAPE: Delta is a poor transactional store. Every insert is
+# a new commit and a new file, and a real storefront would write orders to
+# Postgres or Cosmos DB and land them here by change data capture. At this
+# volume - a handful of orders in a sitting - the direct write is fine, and it
+# is what makes the write-path identity gates visible end to end.
 variable "schemas" {
-  description = "Medallion layers."
+  description = "Medallion layers plus the ops schema that holds the order book."
   type        = list(string)
-  default     = ["bronze", "silver", "gold"]
+  default     = ["bronze", "silver", "gold", "ops"]
 }
 
 variable "databricks_account_id" {

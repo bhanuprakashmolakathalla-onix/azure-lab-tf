@@ -1,5 +1,5 @@
-# The Databricks half of the serving tier: somewhere to run the query, and an
-# identity permitted to run it.
+# The Databricks half of the serving tier: somewhere to run the query, and two
+# identities permitted to run it.
 
 # --- SQL warehouse --------------------------------------------------------
 #
@@ -13,8 +13,12 @@
 # the default is rarely the right answer.
 #
 # SERVERLESS because start-up matters here. A classic warehouse takes minutes to
-# come up; serverless takes seconds, which is the difference between an API that
+# come up; serverless takes seconds, which is the difference between a shop that
 # feels broken after idling and one that feels slow for a moment.
+#
+# ONE warehouse shared by both sites. They query different schemas under
+# different identities, which is what the grants below are for - two warehouses
+# would double the idle risk to enforce a boundary that is already enforced.
 resource "databricks_sql_endpoint" "serving" {
   count = var.serving_compute == "warehouse" ? 1 : 0
 
@@ -22,13 +26,17 @@ resource "databricks_sql_endpoint" "serving" {
   cluster_size              = "2X-Small"
   enable_serverless_compute = true
 
-  # Ten minutes. The warehouse bills only while RUNNING, so this is the single
-  # number that decides whether an occasionally-used API costs Rs 50 a day or
-  # Rs 6,000 a month. Lower is not automatically better - re-starting on every
-  # request is its own kind of waste - but idle time is pure loss.
-  auto_stop_mins = 10
+  # The single number that decides whether an occasionally-used pair of sites
+  # costs tens of rupees a day or thousands a month. The warehouse bills only
+  # while RUNNING.
+  #
+  # Lower is not automatically better - restarting on every request is its own
+  # kind of waste, and a shopper who waits ten seconds twice leaves. Ten minutes
+  # covers a browsing session and closes the tail afterwards.
+  auto_stop_mins = var.warehouse_auto_stop_mins
 
-  # One cluster. Scaling out serves concurrent users; there is one caller here.
+  # One cluster. Scaling out serves concurrent users; there are two apps and one
+  # person.
   max_num_clusters = 1
   min_num_clusters = 1
 
@@ -46,13 +54,13 @@ resource "databricks_sql_endpoint" "serving" {
 
 # --- The cheap alternative ------------------------------------------------
 #
-# A single-node all-purpose cluster serving the same query. Six-to-eight times
+# A single-node all-purpose cluster serving the same queries. Six-to-eight times
 # cheaper per hour and about thirty-five times slower to start.
 #
-# data_security_mode SINGLE_USER pinned to the APP's identity: this cluster
-# exists to serve one caller, and single-user mode is what gives it full Unity
-# Catalog access under that principal. Nobody else can attach to it - which for
-# a serving cluster is a feature.
+# data_security_mode SINGLE_USER pinned to the SHOP's identity: single-user mode
+# gives full Unity Catalog access under exactly one principal, so this option
+# cannot serve both sites at once. That is the honest cost of the cheap path and
+# the reason "warehouse" is the default.
 resource "databricks_cluster" "serving" {
   count = var.serving_compute == "cluster" ? 1 : 0
 
@@ -76,7 +84,7 @@ resource "databricks_cluster" "serving" {
   }
 
   data_security_mode = "SINGLE_USER"
-  single_user_name   = azurerm_user_assigned_identity.app.client_id
+  single_user_name   = azurerm_user_assigned_identity.app["shop"].client_id
 }
 
 data "databricks_spark_version" "lts" {
@@ -91,32 +99,51 @@ locals {
     ) : (
     "/sql/protocolv1/o/${local.ws.workspace_id}/${databricks_cluster.serving[0].id}"
   )
+
+  # What each site may touch, declared once and applied below. Reading this
+  # block should be enough to answer "can the shop see silver?" without opening
+  # anything else.
+  #
+  # The shop holds CREATE_TABLE on ops because it creates the order book on
+  # first checkout - see the note in app/src/db.py about why that DDL is not
+  # Terraform. The console deliberately does not: it works the orders, it does
+  # not define them.
+  schema_grants = {
+    "shop|gold"      = { identity = "shop", schema = "gold", privileges = ["USE_SCHEMA", "SELECT"] }
+    "shop|ops"       = { identity = "shop", schema = "ops", privileges = ["USE_SCHEMA", "SELECT", "MODIFY", "CREATE_TABLE"] }
+    "console|gold"   = { identity = "console", schema = "gold", privileges = ["USE_SCHEMA", "SELECT"] }
+    "console|silver" = { identity = "console", schema = "silver", privileges = ["USE_SCHEMA", "SELECT"] }
+    "console|ops"    = { identity = "console", schema = "ops", privileges = ["USE_SCHEMA", "SELECT", "MODIFY"] }
+  }
 }
 
-# --- The app's identity, Databricks side ----------------------------------
+# --- The apps' identities, Databricks side --------------------------------
 #
-# The managed identity's CLIENT ID is its application id in Entra, and that is
-# the value Databricks registers. One identity, two directories, linked by that
-# GUID - the same three-object shape as the CI principal on Day 5.
+# A managed identity's CLIENT ID is its application id in Entra, and that is the
+# value Databricks registers. One identity, two directories, linked by that
+# GUID - the same three-object shape as the CI principal.
 #
-# NOTE for a future teardown: destroying this DEACTIVATES rather than deletes
-# the account record (Day 15). It does not bite here the way it bit CI, because
-# destroying this module also destroys the managed identity - so a rebuild
-# produces a NEW client id and a fresh registration rather than colliding with
-# the old one. The cost is an inactive record left behind per rebuild.
+# NOTE for a future teardown: destroying these DEACTIVATES rather than deletes
+# the account record. It does not bite the way it bit CI, because destroying
+# this module also destroys the managed identities - so a rebuild produces NEW
+# client ids and fresh registrations rather than colliding with the old ones.
+# The cost is an inactive record left behind per rebuild.
 resource "databricks_service_principal" "app" {
+  for_each = azurerm_user_assigned_identity.app
   provider = databricks.account
 
-  application_id = azurerm_user_assigned_identity.app.client_id
-  display_name   = "sp-fashion-app"
+  application_id = each.value.client_id
+  display_name   = "sp-fashion-${each.key}"
 }
 
-# Gate 2: may it enter the workspace at all. USER, not ADMIN - it reads one
-# table and needs nothing else.
+# Gate 2: may it enter the workspace at all. USER, not ADMIN - these read a
+# handful of tables and write one, and need nothing else.
 resource "databricks_mws_permission_assignment" "app" {
-  provider     = databricks.account
+  for_each = databricks_service_principal.app
+  provider = databricks.account
+
   workspace_id = local.ws.workspace_id
-  principal_id = databricks_service_principal.app.id
+  principal_id = each.value.id
   permissions  = ["USER"]
 }
 
@@ -127,9 +154,12 @@ resource "databricks_permissions" "warehouse" {
   count           = var.serving_compute == "warehouse" ? 1 : 0
   sql_endpoint_id = databricks_sql_endpoint.serving[0].id
 
-  access_control {
-    service_principal_name = azurerm_user_assigned_identity.app.client_id
-    permission_level       = "CAN_USE"
+  dynamic "access_control" {
+    for_each = azurerm_user_assigned_identity.app
+    content {
+      service_principal_name = access_control.value.client_id
+      permission_level       = "CAN_USE"
+    }
   }
 
   depends_on = [databricks_mws_permission_assignment.app]
@@ -153,43 +183,47 @@ resource "databricks_permissions" "cluster" {
   count      = var.serving_compute == "cluster" ? 1 : 0
   cluster_id = databricks_cluster.serving[0].id
 
-  access_control {
-    service_principal_name = azurerm_user_assigned_identity.app.client_id
-    permission_level       = "CAN_RESTART"
+  dynamic "access_control" {
+    for_each = azurerm_user_assigned_identity.app
+    content {
+      service_principal_name = access_control.value.client_id
+      permission_level       = "CAN_RESTART"
+    }
   }
 
   depends_on = [databricks_mws_permission_assignment.app]
 }
 
-# Gate 4: what it may read.
+# Gate 4: what each one may read and write.
 #
-# databricks_grant - SINGULAR. This is the distinction flagged on Day 4 and this
-# is the situation it exists for.
+# databricks_grant - SINGULAR, and now so is the catalog module. The PLURAL
+# databricks_grants is AUTHORITATIVE: it declares the complete privilege set for
+# a securable and revokes anything absent. While data/catalog used the plural
+# form on this catalog, every apply of that module silently stripped the grants
+# below and the sites started reporting that gold did not exist. Two modules
+# granting on one securable means the singular form in both.
 #
-# The PLURAL databricks_grants is AUTHORITATIVE: it declares the complete
-# privilege set for a securable and revokes anything absent. The unity-catalog
-# module already owns `databricks_grants` on the dev catalog. If this module
-# declared one too, each apply would erase the other's grants - a permanent
-# flip-flop between two modules, both "working", neither converging.
-#
-# The singular resource manages ONE principal's privileges and leaves the rest
-# alone. Use it whenever a securable has more than one owner in the codebase.
-#
-# Scoped to the gold SCHEMA, not the catalog: the app serves gold and has no
-# business reading bronze or silver. Granting at catalog level would silently
-# widen its access every time a schema is added.
-resource "databricks_grant" "gold_catalog" {
+# TRAVERSAL AT THE CATALOG, PRIVILEGE AT THE SCHEMA. USE_CATALOG grants no data
+# access on its own - it is the right to walk into the catalog. Granting SELECT
+# here instead would cascade to every schema that exists and every schema added
+# later, which is how a storefront quietly ends up able to read the order book
+# of a business unit that did not exist when it was written.
+resource "databricks_grant" "catalog" {
+  for_each = azurerm_user_assigned_identity.app
+
   catalog    = var.catalog
-  principal  = azurerm_user_assigned_identity.app.client_id
-  privileges = ["USE_CATALOG"] # traversal only - no data access
+  principal  = each.value.client_id
+  privileges = ["USE_CATALOG"]
 
   depends_on = [databricks_mws_permission_assignment.app]
 }
 
-resource "databricks_grant" "gold_schema" {
-  schema     = "${var.catalog}.gold"
-  principal  = azurerm_user_assigned_identity.app.client_id
-  privileges = ["USE_SCHEMA", "SELECT"]
+resource "databricks_grant" "schema" {
+  for_each = local.schema_grants
 
-  depends_on = [databricks_grant.gold_catalog]
+  schema     = "${var.catalog}.${each.value.schema}"
+  principal  = azurerm_user_assigned_identity.app[each.value.identity].client_id
+  privileges = each.value.privileges
+
+  depends_on = [databricks_grant.catalog]
 }

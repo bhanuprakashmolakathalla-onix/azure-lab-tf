@@ -10,6 +10,12 @@ terraform {
       source  = "databricks/databricks"
       version = "~> 1.50"
     }
+    # Only for the bag signing key. Random values live in state, which is why
+    # the state account has shared keys disabled and Entra-only access.
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6"
+    }
   }
 }
 
@@ -29,10 +35,10 @@ provider "databricks" {
   azure_workspace_resource_id = data.terraform_remote_state.workspace.outputs.workspace_resource_id
 }
 
-# Account-scoped: registering the app's managed identity as a Databricks service
+# Account-scoped: registering each managed identity as a Databricks service
 # principal, and assigning it into the workspace. Identity is always
 # account-level once Unity Catalog is on - the same rule as for humans, applied
-# to a robot.
+# to two robots.
 provider "databricks" {
   alias           = "account"
   host            = "https://accounts.azuredatabricks.net"

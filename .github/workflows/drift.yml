@@ -41,8 +41,9 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        # data/* excluded: the databricks provider cannot reach a workspace with
-        # no public endpoint from a GitHub-hosted runner. See terraform.yml.
+        # data/*, app/deploy and infra/compute excluded: the databricks provider
+        # cannot reach a workspace with no public endpoint from a GitHub-hosted
+        # runner. infra/jumpbox needs a password. See terraform.yml for both.
         module: [infra/network, infra/foundation, infra/workspace, infra/governance]
 
     defaults:
